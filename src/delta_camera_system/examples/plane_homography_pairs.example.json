@@ -1,0 +1,24 @@
+{
+  "pairs": [
+    {
+      "label": "origin",
+      "pixel_uv": [320.0, 240.0],
+      "base_xy": [0.0, 0.0]
+    },
+    {
+      "label": "x_plus",
+      "pixel_uv": [420.0, 240.0],
+      "base_xy": [50.0, 0.0]
+    },
+    {
+      "label": "y_plus",
+      "pixel_uv": [320.0, 140.0],
+      "base_xy": [0.0, 50.0]
+    },
+    {
+      "label": "diag",
+      "pixel_uv": [420.0, 140.0],
+      "base_xy": [50.0, 50.0]
+    }
+  ]
+}
