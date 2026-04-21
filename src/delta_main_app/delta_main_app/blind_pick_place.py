@@ -11,40 +11,33 @@ Architecture
 ------------
     BlindPickAndPlace (ROS 2 Node)
         ├── DeltaMotorController   — 3 × RS-00 motors via CAN (can0, motors 1-3)
-        ├── PneumaticGripper       — solenoid valve via CAN (can0, ID 0x10)
+        ├── PneumaticGripper       — solenoid valve via CAN (can0, ID 0x04)
         └── PickSequence (thread)  — runs non-blocking pick-and-place FSM
 
 Pick sequence
 -------------
     IDLE
       ↓ trigger (service call or /delta/blind_target topic)
-    APPROACHING   — trapezoidal arc to (pick_x, pick_y, pick_z + approach_offset)
+    MOVING_TO_PICK   — trapezoidal arc from HOME to (pick_x, pick_y, pick_z)
       ↓
-    PICKING       — slow linear descent to (pick_x, pick_y, pick_z)
+    GRASPING         — pneumatic gripper CLOSE, wait close_settle_s
       ↓
-    GRASPING      — pneumatic gripper CLOSE, wait close_settle_s
+    MOVING_TO_PLACE  — trapezoidal arc to (drop_x, drop_y, drop_z)
       ↓
-    LIFTING       — slow linear rise  to (pick_x, pick_y, pick_z + lift_offset)
+    DROPPING         — pneumatic gripper OPEN, wait open_settle_s
       ↓
-    TRANSPORTING  — trapezoidal arc to (drop_x, drop_y, drop_z)
-      ↓
-    DROPPING      — pneumatic gripper OPEN, wait open_settle_s
-      ↓
-    RESETTING     — trapezoidal arc back to HOME (0, 0, -300 mm)
+    RESETTING        — trapezoidal arc back to HOME (0, 0, -300 mm)
       ↓
     IDLE
 
 ROS 2 Parameters
 ----------------
-    pick_x / pick_y / pick_z       : object position in mm (robot base frame)
-    drop_x / drop_y / drop_z       : drop-off position in mm
-    approach_z_offset              : mm above object for safe approach  [50.0]
-    lift_z_offset                  : mm above object to rise after grasp [70.0]
-    traj_v_max_mm_s                : transport max speed in mm/s         [80.0]
+    pick_x / pick_y / pick_z       : pick position in mm (robot base frame)
+    drop_x / drop_y / drop_z       : place position in mm
+    traj_v_max_mm_s                : max speed in mm/s                   [80.0]
     traj_a_max_mm_s2               : trajectory acceleration in mm/s²   [200.0]
     traj_dt_s                      : trajectory update period in seconds  [0.05]
-    pick_v_max_mm_s                : approach/pick/lift speed in mm/s    [40.0]
-    pneumatic_can_id               : CAN ID of pneumatic controller      [0x01]
+    pneumatic_can_id               : CAN ID of pneumatic controller      [0x4]
     pneumatic_can_channel          : CAN channel for pneumatic           [can0]
 
 Topics
@@ -63,7 +56,6 @@ Services
         Start a pick cycle at the configured pick_x/y/z parameter position.
 """
 
-import math
 import threading
 import time
 
@@ -81,11 +73,6 @@ from delta_motor_controller.pneumatic_gripper import PneumaticGripper
 
 # ── resting / home position ───────────────────────────────────────────────────
 HOME_X, HOME_Y, HOME_Z = 0.0, 0.0, -300.0
-
-
-def _clamp_z(z: float) -> float:
-    """Clamp Z to the valid workspace range so thetas stay non-negative."""
-    return max(config.Z_MIN, min(config.Z_MAX, z))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -107,12 +94,9 @@ class BlindPickAndPlace(Node):
         self.declare_parameter('drop_x',              0.0)
         self.declare_parameter('drop_y',            -80.0)
         self.declare_parameter('drop_z',           -300.0)
-        self.declare_parameter('approach_z_offset',  50.0)
-        self.declare_parameter('lift_z_offset',      70.0)
         self.declare_parameter('traj_v_max_mm_s',    80.0)
         self.declare_parameter('traj_a_max_mm_s2',  200.0)
         self.declare_parameter('traj_dt_s',           0.05)
-        self.declare_parameter('pick_v_max_mm_s',    40.0)
         self.declare_parameter('pneumatic_can_id',   4)
 
         # ── motor controller ──────────────────────────────────────────────
@@ -186,91 +170,62 @@ class BlindPickAndPlace(Node):
         ).start()
 
     def _run_sequence(self, pick_xyz) -> None:
-        """Full pick-and-place sequence.  Runs in a background thread."""
+        """4-waypoint pick-and-place sequence.  Runs in a background thread.
+
+        Waypoints: HOME → PICK (close gripper) → PLACE (open gripper) → HOME
+        """
         log = self.get_logger()
         p = self.get_parameter
 
-        drop    = (p('drop_x').value, p('drop_y').value, p('drop_z').value)
-        az_off  = p('approach_z_offset').value
-        lz_off  = p('lift_z_offset').value
-        v_max   = p('traj_v_max_mm_s').value
-        a_max   = p('traj_a_max_mm_s2').value
-        dt      = p('traj_dt_s').value
-        v_pick  = p('pick_v_max_mm_s').value
-
-        px, py, pz = pick_xyz
-        approach = (px, py, _clamp_z(pz + az_off))
-        lift     = (px, py, _clamp_z(pz + lz_off))
-        home     = (HOME_X, HOME_Y, HOME_Z)
-
-        if approach[2] != pz + az_off:
-            log.warn(f'Approach Z clamped to workspace limit: {approach[2]:.1f} mm')
-        if lift[2] != pz + lz_off:
-            log.warn(f'Lift Z clamped to workspace limit: {lift[2]:.1f} mm')
+        place = (p('drop_x').value, p('drop_y').value, p('drop_z').value)
+        v_max = p('traj_v_max_mm_s').value
+        a_max = p('traj_a_max_mm_s2').value
+        dt    = p('traj_dt_s').value
+        home  = (HOME_X, HOME_Y, HOME_Z)
 
         try:
-            # ── 1. Read current end-effector position ─────────────────────
-            ok, cx, cy, cz = self._ctrl.get_current_xyz()
-            current = (cx, cy, cz) if ok else home
-
-            # ── 2. APPROACHING — safe height above pick point ─────────────
-            self._publish_state('APPROACHING')
-            log.info(
-                f'[APPROACHING]  target=({approach[0]:.1f}, {approach[1]:.1f}, '
-                f'{approach[2]:.1f})')
-            wps = linear_waypoints(current, approach, v_max=v_max, a_max=a_max, dt=dt)
+            # ── 1. MOVING_TO_PICK — home → pick position ──────────────────
+            self._publish_state('MOVING_TO_PICK')
+            log.info(f'[MOVING_TO_PICK]  {home} → {pick_xyz}')
+            wps = linear_waypoints(home, pick_xyz, v_max=v_max, a_max=a_max, dt=dt)
             if not self._ctrl.execute_trajectory(wps, dt=dt):
-                raise RuntimeError('APPROACH trajectory did not reach target')
+                raise RuntimeError('MOVING_TO_PICK trajectory did not reach target')
 
-            # ── 3. PICKING — slow linear descent to object ────────────────
-            self._publish_state('PICKING')
-            pick_pos = (px, py, pz)
-            log.info(f'[PICKING]  descend to ({px:.1f}, {py:.1f}, {pz:.1f})')
-            wps = linear_waypoints(approach, pick_pos, v_max=v_pick, a_max=a_max, dt=dt)
-            if not self._ctrl.execute_trajectory(wps, dt=dt):
-                raise RuntimeError('PICK descent did not reach target')
-
-            # ── 4. GRASPING — energize pneumatic solenoid ─────────────────
+            # ── 2. GRASPING — energize pneumatic solenoid ─────────────────
             self._publish_state('GRASPING')
             log.info('[GRASPING]  closing gripper')
             if config.ENABLE_MOTORS:
                 self._gripper.close(wait=True)
 
-            # ── 5. LIFTING — slow rise while holding object ───────────────
-            self._publish_state('LIFTING')
-            log.info(
-                f'[LIFTING]  rise to ({lift[0]:.1f}, {lift[1]:.1f}, {lift[2]:.1f})')
-            wps = linear_waypoints(pick_pos, lift, v_max=v_pick, a_max=a_max, dt=dt)
+            # ── 3. MOVING_TO_PLACE — pick position → place position ───────
+            self._publish_state('MOVING_TO_PLACE')
+            log.info(f'[MOVING_TO_PLACE]  {pick_xyz} → {place}')
+            wps = linear_waypoints(pick_xyz, place, v_max=v_max, a_max=a_max, dt=dt)
             if not self._ctrl.execute_trajectory(wps, dt=dt):
-                raise RuntimeError('LIFT trajectory did not reach target')
+                raise RuntimeError('MOVING_TO_PLACE trajectory did not reach target')
 
-            # ── 6. TRANSPORTING — arc to drop position ────────────────────
-            self._publish_state('TRANSPORTING')
-            log.info(
-                f'[TRANSPORTING]  to drop ({drop[0]:.1f}, {drop[1]:.1f}, {drop[2]:.1f})')
-            wps = linear_waypoints(lift, drop, v_max=v_max, a_max=a_max, dt=dt)
-            if not self._ctrl.execute_trajectory(wps, dt=dt):
-                raise RuntimeError('TRANSPORT trajectory did not reach target')
-
-            # ── 7. DROPPING — de-energize solenoid ────────────────────────
+            # ── 4. DROPPING — de-energize solenoid ────────────────────────
             self._publish_state('DROPPING')
             log.info('[DROPPING]  opening gripper')
             if config.ENABLE_MOTORS:
                 self._gripper.open(wait=True)
 
-        except RuntimeError as exc:
-            log.error(f'Sequence aborted: {exc}')
+        except Exception as exc:
+            log.error(f'Sequence aborted: {type(exc).__name__}: {exc}')
             if config.ENABLE_MOTORS:
                 self._gripper.open(wait=False)   # safety: release on any failure
 
         finally:
-            # ── 8. RESETTING — return arm to home position ────────────────
+            # ── 5. RESETTING — return arm to home position ────────────────
             self._publish_state('RESETTING')
-            ok, cx, cy, cz = self._ctrl.get_current_xyz()
-            current = (cx, cy, cz) if ok else home
-            log.info(f'[RESETTING]  returning home ({HOME_X}, {HOME_Y}, {HOME_Z})')
-            wps = linear_waypoints(current, home, v_max=v_max, a_max=a_max, dt=dt)
-            self._ctrl.execute_trajectory(wps, dt=dt)
+            try:
+                ok, cx, cy, cz = self._ctrl.get_current_xyz()
+                current = (cx, cy, cz) if ok else place
+                log.info(f'[RESETTING]  returning home {home}')
+                wps = linear_waypoints(current, home, v_max=v_max, a_max=a_max, dt=dt)
+                self._ctrl.execute_trajectory(wps, dt=dt)
+            except Exception as exc:
+                log.error(f'RESETTING failed: {exc}')
 
             with self._lock:
                 self._busy = False

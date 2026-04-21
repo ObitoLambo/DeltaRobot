@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
             'main_app        = delta_main_app.main_app:main',
             'blind_pick_place = delta_main_app.blind_pick_place:main',
+            'pick_place_ui    = delta_main_app.pick_place_ui:main',
         ],
     },
 )

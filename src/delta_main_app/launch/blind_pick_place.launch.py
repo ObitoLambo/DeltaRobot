@@ -31,5 +31,5 @@ def generate_launch_description():
         can_driver,
         # Wait for can_driver to bring up can0 before the motor controller
         # tries to open its own socketcan socket on the same interface.
-        TimerAction(period=3.0, actions=[blind_pick_place]),
+        TimerAction(period=8.0, actions=[blind_pick_place]),
     ])

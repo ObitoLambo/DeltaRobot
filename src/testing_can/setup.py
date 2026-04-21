@@ -17,7 +17,7 @@ setup(
     maintainer_email='demo@todo.todo',
     description='TODO: Package description',
     license='TODO: License declaration',
-    tests_require=['pytest'],
+    extras_require={'test': ['pytest']},
     entry_points={
         'console_scripts': [
             'test_relay_node = testing_can.Testing_relay:main',

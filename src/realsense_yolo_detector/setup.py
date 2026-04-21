@@ -17,7 +17,7 @@ setup(
     maintainer_email='you@example.com',
     description='YOLO object detector for Intel RealSense ROS 2 topics',
     license='Apache-2.0',
-    tests_require=['pytest'],
+    extras_require={'test': ['pytest']},
     entry_points={
         'console_scripts': [
             'yolo_detector = realsense_yolo_detector.yolo_detector_node:main',

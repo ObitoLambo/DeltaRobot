@@ -37,3 +37,10 @@ env/
 
 # Test output
 .pytest_cache/
+
+# Thesis / presentation files (large, non-code)
+*.zip
+*.pptx
+Thesis_in_Latex_GIM_V7_Ougy___Panha/
+slide_images/
+.codex

@@ -19,7 +19,7 @@ setup(
     maintainer_email='you@example.com',
     description='A simple ROS2 package',
     license='Apache License 2.0',
-    tests_require=['pytest'],
+    extras_require={'test': ['pytest']},
     entry_points={
         'console_scripts': [
             'can_driver_node = can_driver.can_driver:main',
