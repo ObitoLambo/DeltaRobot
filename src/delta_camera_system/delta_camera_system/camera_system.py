@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import Pose, PoseArray, PointStamped
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
@@ -52,18 +52,19 @@ class DeltaCamera(Node):
 
         self.last_print_time = 0.0
         self.last_fake_move_time = 0.0
-        self.last_confirm_track_id = None
-        self.confirm_track_count = 0
+        self._last_target_publish_time = 0.0
+        self._confirm_counts: dict = {}
         self.no_detection_count = 0
+        self._frame_times: deque = deque(maxlen=30)
+        self._proc_times: deque = deque(maxlen=30)
 
-        self.camera_rotation = self.build_camera_rotation_matrix()
-        self.camera_translation = np.array(
-            [config.CAM_TX_MM, config.CAM_TY_MM, config.CAM_TZ_MM],
-            dtype=np.float64,
-        )
+        self.T_cam_to_base, self.T_base_to_cam = self._build_T_cam_to_base()
+        self.camera_rotation    = self.T_cam_to_base[:3, :3]
+        self.camera_translation = self.T_cam_to_base[:3,  3]
         self.plane_homography = self.build_plane_homography()
 
         self.xyz_buffer = deque(maxlen=config.AVG_FRAME_COUNT)
+        self._timed_xyz_buf = deque(maxlen=config.AVG_FRAME_COUNT)
         self.depth_buffer = deque(maxlen=config.DEPTH_HISTORY_SIZE)
         self.last_track_id = None
         self.last_depth_track_id = None
@@ -78,8 +79,10 @@ class DeltaCamera(Node):
         self.sub_info = self.create_subscription(
             CameraInfo, config.CAMERA_INFO_TOPIC, self.info_callback, 10
         )
-        self._pub_target = self.create_publisher(PointStamped, "/delta/target_xyz", 10)
-        self._pub_status = self.create_publisher(String, "/delta/detection_status", 10)
+        self._pub_target      = self.create_publisher(PointStamped, "/delta/target_xyz",          10)
+        self._pub_velocity    = self.create_publisher(PointStamped, "/delta/object_velocity_mm_s", 10)
+        self._pub_status      = self.create_publisher(String,       "/delta/detection_status",     10)
+        self._pub_all_targets = self.create_publisher(PoseArray,    "/delta/all_targets",          10)
 
         mode = "FAKE DEPTH" if config.FAKE_DEPTH_ENABLE else "REAL DEPTH"
         self.get_logger().info(
@@ -115,6 +118,9 @@ class DeltaCamera(Node):
         if self.fx is None:
             return
 
+        t_start = time.perf_counter()
+        self._frame_times.append(t_start)
+
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as ex:
@@ -123,13 +129,28 @@ class DeltaCamera(Node):
 
         annotated, best = self.process_frame(frame)
 
+        t_end = time.perf_counter()
+        self._proc_times.append(t_end - t_start)
+
         if best is not None:
             self.maybe_print_result(best)
             self.fake_motor_command(best)
 
         if self.VIEW_IMAGE:
+            self._draw_perf_overlay(annotated)
             cv2.imshow("Delta Camera", annotated)
             cv2.waitKey(1)
+
+    def _draw_perf_overlay(self, frame):
+        if len(self._frame_times) >= 2:
+            dt = self._frame_times[-1] - self._frame_times[0]
+            fps = (len(self._frame_times) - 1) / dt if dt > 0 else 0.0
+        else:
+            fps = 0.0
+        avg_ms = (sum(self._proc_times) / len(self._proc_times) * 1000) if self._proc_times else 0.0
+        text = f"FPS: {fps:.1f}  proc: {avg_ms:.1f} ms"
+        cv2.putText(frame, text, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(frame, text, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
     def process_frame(self, frame):
         annotated = frame.copy()
@@ -147,6 +168,7 @@ class DeltaCamera(Node):
             return annotated, best
 
         self.no_detection_count = 0
+        all_candidates = []
 
         for det in detections:
             x1 = det["x1"]
@@ -293,7 +315,11 @@ class DeltaCamera(Node):
                 reason = "WAIT_AVG"
                 if xyz_avg is not None:
                     x_use, y_use, z_use = xyz_avg
-                    if not self.is_stable(xyz_avg):
+                    if config.CONVEYOR_MODE:
+                        # Object is moving — skip stability check, use averaged position
+                        allowed = True
+                        reason = "CONVEYOR_OK"
+                    elif not self.is_stable(xyz_avg):
                         reason = "NOT_STABLE"
                     elif config.VISION_ONLY_ENABLE:
                         allowed = True
@@ -393,6 +419,8 @@ class DeltaCamera(Node):
                 "reason": reason,
             }
 
+            all_candidates.append(candidate)
+
             best_depth_key = z_cam if pure_camera_mode else z_use
             current_best_depth_key = None
             if best is not None:
@@ -406,13 +434,43 @@ class DeltaCamera(Node):
             status_msg.data = best["reason"]
             self._pub_status.publish(status_msg)
             if best["allowed"]:
-                pt = PointStamped()
-                pt.header.stamp = self.get_clock().now().to_msg()
-                pt.header.frame_id = "robot_base"
-                pt.point.x = best["x_base"] / 1000.0
-                pt.point.y = best["y_base"] / 1000.0
-                pt.point.z = best["z_base"] / 1000.0
-                self._pub_target.publish(pt)
+                now_t = time.time()
+                cooldown_ok = (now_t - self._last_target_publish_time) >= config.TARGET_PUBLISH_COOLDOWN_SEC
+                if cooldown_ok:
+                    self._last_target_publish_time = now_t
+                    stamp = self.get_clock().now().to_msg()
+
+                    pt = PointStamped()
+                    pt.header.stamp = stamp
+                    pt.header.frame_id = "robot_base"
+                    pt.point.x = best["x_base"] / 1000.0
+                    pt.point.z = best["z_base"] / 1000.0
+                    if config.CONVEYOR_MODE and len(self._timed_xyz_buf) > 0:
+                        # Use the most recent raw Y to avoid the ~(AVG_FRAME_COUNT/2)-frame
+                        # median lag. The robot's prediction adds vy*t_travel on top of this.
+                        pt.point.y = self._timed_xyz_buf[-1][2] / 1000.0
+                    else:
+                        pt.point.y = best["y_base"] / 1000.0
+                    self._pub_target.publish(pt)
+
+                    vel = PointStamped()
+                    vel.header.stamp = stamp
+                    vel.header.frame_id = "robot_base"
+                    vel.point.y = self._estimate_vy()   # mm/s along -Y conveyor axis
+                    self._pub_velocity.publish(vel)
+
+        allowed_targets = [c for c in all_candidates if c["allowed"]]
+        if allowed_targets:
+            pa = PoseArray()
+            pa.header.stamp = self.get_clock().now().to_msg()
+            pa.header.frame_id = "robot_base"
+            for c in allowed_targets:
+                p = Pose()
+                p.position.x = c["x_base"] / 1000.0
+                p.position.y = c["y_base"] / 1000.0
+                p.position.z = c["z_base"] / 1000.0
+                pa.poses.append(p)
+            self._pub_all_targets.publish(pa)
 
         return annotated, best
 
@@ -420,6 +478,14 @@ class DeltaCamera(Node):
         if self.DETECTION_MODE == "white_rectangle":
             rect_detections = self.find_white_rectangle_detections(frame)
             return self.prioritize_workspace_detections(frame, rect_detections)
+        if self.DETECTION_MODE == "blue_rectangle":
+            rect_detections = self.find_blue_rectangle_detections(frame)
+            return self.prioritize_workspace_detections(frame, rect_detections)
+        if self.DETECTION_MODE == "orange_square":
+            rect_detections = self.find_orange_square_detections(frame)
+            return self.prioritize_workspace_detections(frame, rect_detections)
+        if self.DETECTION_MODE == "orange_blob":
+            return self.prioritize_workspace_detections(frame, self.find_orange_blob_detections(frame))
         if self.DETECTION_MODE == "depth_foreground":
             depth_detections = self.find_depth_foreground_detections(frame, depth_image)
             if depth_detections:
@@ -431,6 +497,9 @@ class DeltaCamera(Node):
         return self.find_yolo_detections(frame)
 
     def draw_workspace_overlay(self, annotated, frame_w: int, frame_h: int):
+        if config.DRAW_WORKSPACE_ZONES:
+            self.draw_conveyor_zones(annotated, frame_w, frame_h)
+
         if config.WORKSPACE_ROI_ENABLE:
             x1, y1, x2, y2 = self.get_workspace_roi(frame_w, frame_h)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 200, 0), 1)
@@ -443,6 +512,96 @@ class DeltaCamera(Node):
                 cv2.fillPoly(overlay, [polygon], (40, 40, 180))
                 cv2.polylines(annotated, [polygon], True, (60, 60, 255), 2)
             cv2.addWeighted(overlay, 0.18, annotated, 0.82, 0.0, annotated)
+
+    def draw_conveyor_zones(self, annotated, frame_w: int, frame_h: int):
+        """Overlay three zones projected from robot base frame onto the camera image.
+
+        Zone layout (conveyor moves objects in the -Y direction of robot base):
+          APPROACH (amber) — object visible but not yet in robot reach (y > +Y_LIMIT)
+          WORKSPACE (green) — robot can pick here (|x|,|y| within ±X_LIMIT/Y_LIMIT)
+          EXIT (red) — object has passed workspace (y < -Y_LIMIT)
+
+        The workspace square is projected to pixels using T_base_to_cam + pinhole
+        projection, so it automatically accounts for camera position and orientation.
+        """
+        if self.fx is None:
+            return
+
+        L = config.X_LIMIT          # 151.563 mm — half-width of workspace square
+        z = config.WORKSPACE_PICK_Z_MM  # belt surface in base frame
+
+        # Project 4 corners of the reachable square at pick Z.
+        # Split into entry edge (y=+L, where belt objects arrive) and
+        # exit edge (y=-L, where objects leave robot reach).
+        entry_px, exit_px = [], []
+        for sx in (-1.0, 1.0):
+            for sy, bucket in ((+1.0, entry_px), (-1.0, exit_px)):
+                pt = self._project_base_to_pixel(sx * L, sy * L, z)
+                if pt is None:
+                    return   # camera not ready or point behind camera
+                bucket.append(pt)
+
+        # Sort each edge by pixel u so polygon vertices wind consistently
+        entry_px.sort(key=lambda p: p[0])
+        exit_px.sort(key=lambda p: p[0])
+        el, er = entry_px   # left & right pixel of entry edge (high v, near bottom)
+        xl, xr = exit_px    # left & right pixel of exit edge  (low v,  near top)
+
+        # Skip drawing if the projection is wildly outside the frame
+        all_v = [el[1], er[1], xl[1], xr[1]]
+        if min(all_v) > 2 * frame_h or max(all_v) < -frame_h:
+            return
+
+        overlay = annotated.copy()
+
+        # ── fill zones ────────────────────────────────────────────────────────
+        # Approach: entry edge → bottom of image
+        ap_poly = np.array([[0, frame_h], [frame_w, frame_h],
+                             list(er), list(el)], dtype=np.int32)
+        cv2.fillPoly(overlay, [ap_poly], (0, 160, 255))          # amber
+
+        # Robot workspace: the 4 projected corners
+        ws_poly = np.array([list(el), list(er), list(xr), list(xl)], dtype=np.int32)
+        cv2.fillPoly(overlay, [ws_poly], (0, 200, 60))           # green
+
+        # Exit: top of image → exit edge
+        ex_poly = np.array([[0, 0], [frame_w, 0],
+                             list(xr), list(xl)], dtype=np.int32)
+        cv2.fillPoly(overlay, [ex_poly], (60, 60, 200))          # red
+
+        cv2.addWeighted(overlay, 0.20, annotated, 0.80, 0.0, annotated)
+
+        # ── border lines ──────────────────────────────────────────────────────
+        cv2.polylines(annotated, [ws_poly], True, (0, 255, 60), 2)
+        cv2.line(annotated, tuple(el), tuple(er), (0, 160, 255), 2)  # entry
+        cv2.line(annotated, tuple(xl), tuple(xr), (60, 60, 200), 2)  # exit
+
+        # ── zone labels ───────────────────────────────────────────────────────
+        def put_label(text, tx, ty, color):
+            tx = max(4, min(frame_w - 120, tx - 55))
+            ty = max(16, min(frame_h - 6, ty))
+            cv2.putText(annotated, text, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(annotated, text, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color,     2, cv2.LINE_AA)
+
+        put_label("APPROACH",
+                  frame_w // 2, (frame_h + el[1]) // 2, (0, 160, 255))
+        put_label("ROBOT WORKSPACE",
+                  (el[0] + xr[0]) // 2, (el[1] + xr[1]) // 2, (0, 255, 60))
+        put_label("EXIT",
+                  frame_w // 2, xl[1] // 2, (60, 60, 200))
+
+        # ── conveyor direction arrow ──────────────────────────────────────────
+        # Belt moves objects from approach (high v) toward exit (low v) = upward in image
+        ax = frame_w - 36
+        av_start = min(frame_h - 10, el[1] + 20)
+        av_end   = max(10,           xl[1] - 20)
+        if av_start > av_end:
+            cv2.arrowedLine(annotated, (ax, av_start), (ax, av_end),
+                            (220, 220, 220), 2, tipLength=0.20)
+            cv2.putText(annotated, "-Y", (ax - 16, (av_start + av_end) // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
 
     def draw_base_axis_overlay(self, annotated, x1: int, y1: int, x2: int, y2: int):
         roi_w = max(1, x2 - x1)
@@ -711,12 +870,8 @@ class DeltaCamera(Node):
         return prioritized
 
     def update_detection_confirmation(self, track_id: str) -> bool:
-        if self.last_confirm_track_id != track_id:
-            self.last_confirm_track_id = track_id
-            self.confirm_track_count = 1
-        else:
-            self.confirm_track_count += 1
-        return self.confirm_track_count >= config.DETECTION_CONFIRM_FRAMES
+        self._confirm_counts[track_id] = self._confirm_counts.get(track_id, 0) + 1
+        return self._confirm_counts[track_id] >= config.DETECTION_CONFIRM_FRAMES
 
     def handle_no_detection(self):
         self.no_detection_count += 1
@@ -725,12 +880,12 @@ class DeltaCamera(Node):
 
     def reset_tracking_state(self):
         self.xyz_buffer.clear()
+        self._timed_xyz_buf.clear()
         self.depth_buffer.clear()
         self.last_track_id = None
         self.last_depth_track_id = None
         self.last_stable_xyz = None
-        self.last_confirm_track_id = None
-        self.confirm_track_count = 0
+        self._confirm_counts = {}
         self.no_detection_count = 0
 
     def depth_image_to_meters(self, depth_image):
@@ -1000,6 +1155,294 @@ class DeltaCamera(Node):
                     "corners_uv": corners_uv.astype(np.float32),
                     "validated_box_like": True,
                     "score": area * rectangularity * aspect_ratio * center_weight * max(contrast, 1.0),
+                }
+            )
+
+        detections.sort(key=lambda det: det["score"], reverse=True)
+        return detections
+
+    def find_blue_rectangle_detections(self, frame):
+        frame_h, frame_w = frame.shape[:2]
+        rx1, ry1, rx2, ry2 = self.get_workspace_roi(frame_w, frame_h)
+        roi = frame[ry1:ry2, rx1:rx2]
+        if roi.size == 0:
+            return []
+
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        # Blue hue band: H 100-130 (OpenCV 0-180 scale), saturated, not too dark
+        blue_mask = cv2.inRange(
+            hsv,
+            (int(config.BLUE_RECT_HUE_LOW),  int(config.BLUE_RECT_SAT_MIN), int(config.BLUE_RECT_VAL_MIN)),
+            (int(config.BLUE_RECT_HUE_HIGH), 255, 255),
+        )
+
+        open_k  = self.make_odd(config.BLUE_RECT_MASK_OPEN_PX)
+        close_k = self.make_odd(config.BLUE_RECT_MASK_CLOSE_PX)
+        blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN,
+                                     np.ones((open_k,  open_k),  np.uint8))
+        blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE,
+                                     np.ones((close_k, close_k), np.uint8))
+
+        exclusion_mask = self.get_robot_exclusion_mask(frame_w, frame_h)[ry1:ry2, rx1:rx2]
+        if exclusion_mask.size != 0:
+            blue_mask[exclusion_mask > 0] = 0
+
+        contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        roi_area  = float(max(1, (rx2 - rx1) * (ry2 - ry1)))
+        frame_cx  = frame_w * 0.5
+        frame_cy  = frame_h * 0.5
+        sat_chan   = hsv[:, :, 1]
+        detections = []
+
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < config.BLUE_RECT_MIN_AREA_PX or area > roi_area * config.BLUE_RECT_MAX_AREA_RATIO:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < config.BLUE_RECT_MIN_WIDTH_PX or h < config.BLUE_RECT_MIN_HEIGHT_PX:
+                continue
+
+            border_margin = max(0, int(config.BLUE_RECT_BORDER_REJECT_PX))
+            if (
+                x <= border_margin
+                or y <= border_margin
+                or (x + w) >= (blue_mask.shape[1] - border_margin)
+                or (y + h) >= (blue_mask.shape[0] - border_margin)
+            ):
+                continue
+
+            # Mean saturation inside the contour as a quality/confidence measure
+            obj_mask = np.zeros(roi.shape[:2], np.uint8)
+            cv2.drawContours(obj_mask, [contour], -1, 255, -1)
+            mean_sat = float(cv2.mean(sat_chan, mask=obj_mask)[0])
+            if mean_sat < config.BLUE_RECT_MIN_SAT_MEAN:
+                continue
+
+            full_contour = contour + np.array([[[rx1, ry1]]], dtype=np.int32)
+            corners_uv, rectangularity, aspect_ratio = self.extract_rectangle_corners(
+                full_contour,
+                frame_gray=frame_gray,
+            )
+            if corners_uv is None:
+                continue
+            if rectangularity < config.BLUE_RECT_MIN_RECTANGULARITY:
+                continue
+            if not (config.BLUE_RECT_MIN_ASPECT_RATIO <= aspect_ratio <= config.BLUE_RECT_MAX_ASPECT_RATIO):
+                continue
+
+            corners_i = np.round(corners_uv).astype(np.int32)
+            x1 = int(np.min(corners_i[:, 0]))
+            y1 = int(np.min(corners_i[:, 1]))
+            x2 = int(np.max(corners_i[:, 0]))
+            y2 = int(np.max(corners_i[:, 1]))
+            depth_contour = self.find_parent_dark_contour(frame_gray, corners_i)
+            if depth_contour is not None:
+                dx, dy, dw, dh = cv2.boundingRect(depth_contour)
+                depth_bbox = (int(dx), int(dy), int(dx + dw), int(dy + dh))
+            else:
+                depth_bbox = (x1, y1, x2, y2)
+            bbox_cx = float(np.mean(corners_uv[:, 0]))
+            bbox_cy = float(np.mean(corners_uv[:, 1]))
+            norm_dx = abs(bbox_cx - frame_cx) / max(frame_cx, 1.0)
+            norm_dy = abs(bbox_cy - frame_cy) / max(frame_cy, 1.0)
+            center_weight = max(0.2, 1.0 - 0.35 * (norm_dx + norm_dy))
+
+            detections.append(
+                {
+                    "name": "blue_rect",
+                    "conf": float(np.clip((mean_sat - config.BLUE_RECT_MIN_SAT_MEAN) / 80.0, 0.0, 1.0)),
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "bbox_center": (int(round(bbox_cx)), int(round(bbox_cy))),
+                    "primary_contour": corners_i.reshape(-1, 1, 2),
+                    "outer_contour":   corners_i.reshape(-1, 1, 2),
+                    "depth_contour":   depth_contour,
+                    "depth_bbox":      depth_bbox,
+                    "corners_uv":      corners_uv.astype(np.float32),
+                    "validated_box_like": True,
+                    "score": area * rectangularity * aspect_ratio * center_weight * max(mean_sat, 1.0),
+                }
+            )
+
+        detections.sort(key=lambda det: det["score"], reverse=True)
+        return detections
+
+    def find_orange_blob_detections(self, frame):
+        frame_h, frame_w = frame.shape[:2]
+        rx1, ry1, rx2, ry2 = self.get_workspace_roi(frame_w, frame_h)
+        roi = frame[ry1:ry2, rx1:rx2]
+        if roi.size == 0:
+            return []
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(
+            hsv,
+            (int(config.ORANGE_BLOB_HUE_LOW),  int(config.ORANGE_BLOB_SAT_MIN), int(config.ORANGE_BLOB_VAL_MIN)),
+            (int(config.ORANGE_BLOB_HUE_HIGH), 255, 255),
+        )
+
+        open_k  = self.make_odd(config.ORANGE_BLOB_MASK_OPEN_PX)
+        close_k = self.make_odd(config.ORANGE_BLOB_MASK_CLOSE_PX)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((open_k,  open_k),  np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
+
+        exclusion = self.get_robot_exclusion_mask(frame_w, frame_h)[ry1:ry2, rx1:rx2]
+        if exclusion.size != 0:
+            mask[exclusion > 0] = 0
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        roi_area   = float(max(1, (rx2 - rx1) * (ry2 - ry1)))
+        border     = max(0, int(config.ORANGE_BLOB_BORDER_REJECT_PX))
+        detections = []
+
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < config.ORANGE_BLOB_MIN_AREA_PX or area > roi_area * config.ORANGE_BLOB_MAX_AREA_RATIO:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+            if (x <= border or y <= border
+                    or (x + w) >= (mask.shape[1] - border)
+                    or (y + h) >= (mask.shape[0] - border)):
+                continue
+
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"]) + rx1
+            cy = int(M["m01"] / M["m00"]) + ry1
+
+            full_contour = contour + np.array([[[rx1, ry1]]], dtype=np.int32)
+            x1 = x + rx1
+            y1 = y + ry1
+            x2 = x1 + w
+            y2 = y1 + h
+
+            detections.append({
+                "name": "orange_blob",
+                "conf": min(1.0, area / 230.0),   # normalise against expected 30mm area
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "bbox_center": (cx, cy),
+                "primary_contour": full_contour,
+                "outer_contour":   full_contour,
+                "depth_contour":   full_contour,
+                "depth_bbox":      (x1, y1, x2, y2),
+                "corners_uv":      None,           # centroid only — no corner extraction
+                "validated_box_like": True,        # skip box-shape check
+                "score": area,
+            })
+
+        detections.sort(key=lambda d: d["score"], reverse=True)
+        return detections
+
+    def find_orange_square_detections(self, frame):
+        frame_h, frame_w = frame.shape[:2]
+        rx1, ry1, rx2, ry2 = self.get_workspace_roi(frame_w, frame_h)
+        roi = frame[ry1:ry2, rx1:rx2]
+        if roi.size == 0:
+            return []
+
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        orange_mask = cv2.inRange(
+            hsv,
+            (int(config.ORANGE_SQ_HUE_LOW),  int(config.ORANGE_SQ_SAT_MIN), int(config.ORANGE_SQ_VAL_MIN)),
+            (int(config.ORANGE_SQ_HUE_HIGH), 255, 255),
+        )
+
+        open_k  = self.make_odd(config.ORANGE_SQ_MASK_OPEN_PX)
+        close_k = self.make_odd(config.ORANGE_SQ_MASK_CLOSE_PX)
+        orange_mask = cv2.morphologyEx(orange_mask, cv2.MORPH_OPEN,
+                                       np.ones((open_k,  open_k),  np.uint8))
+        orange_mask = cv2.morphologyEx(orange_mask, cv2.MORPH_CLOSE,
+                                       np.ones((close_k, close_k), np.uint8))
+
+        exclusion_mask = self.get_robot_exclusion_mask(frame_w, frame_h)[ry1:ry2, rx1:rx2]
+        if exclusion_mask.size != 0:
+            orange_mask[exclusion_mask > 0] = 0
+
+        contours, _ = cv2.findContours(orange_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        roi_area  = float(max(1, (rx2 - rx1) * (ry2 - ry1)))
+        frame_cx  = frame_w * 0.5
+        frame_cy  = frame_h * 0.5
+        sat_chan   = hsv[:, :, 1]
+        detections = []
+
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < config.ORANGE_SQ_MIN_AREA_PX or area > roi_area * config.ORANGE_SQ_MAX_AREA_RATIO:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < config.ORANGE_SQ_MIN_WIDTH_PX or h < config.ORANGE_SQ_MIN_HEIGHT_PX:
+                continue
+
+            border_margin = max(0, int(config.ORANGE_SQ_BORDER_REJECT_PX))
+            if (
+                x <= border_margin
+                or y <= border_margin
+                or (x + w) >= (orange_mask.shape[1] - border_margin)
+                or (y + h) >= (orange_mask.shape[0] - border_margin)
+            ):
+                continue
+
+            obj_mask = np.zeros(roi.shape[:2], np.uint8)
+            cv2.drawContours(obj_mask, [contour], -1, 255, -1)
+            mean_sat = float(cv2.mean(sat_chan, mask=obj_mask)[0])
+            if mean_sat < config.ORANGE_SQ_MIN_SAT_MEAN:
+                continue
+
+            full_contour = contour + np.array([[[rx1, ry1]]], dtype=np.int32)
+            corners_uv, rectangularity, aspect_ratio = self.extract_rectangle_corners(
+                full_contour,
+                frame_gray=frame_gray,
+            )
+            if corners_uv is None:
+                continue
+            if rectangularity < config.ORANGE_SQ_MIN_RECTANGULARITY:
+                continue
+            if not (config.ORANGE_SQ_MIN_ASPECT_RATIO <= aspect_ratio <= config.ORANGE_SQ_MAX_ASPECT_RATIO):
+                continue
+
+            corners_i = np.round(corners_uv).astype(np.int32)
+            x1 = int(np.min(corners_i[:, 0]))
+            y1 = int(np.min(corners_i[:, 1]))
+            x2 = int(np.max(corners_i[:, 0]))
+            y2 = int(np.max(corners_i[:, 1]))
+            depth_contour = self.find_parent_dark_contour(frame_gray, corners_i)
+            if depth_contour is not None:
+                dx, dy, dw, dh = cv2.boundingRect(depth_contour)
+                depth_bbox = (int(dx), int(dy), int(dx + dw), int(dy + dh))
+            else:
+                depth_bbox = (x1, y1, x2, y2)
+            bbox_cx = float(np.mean(corners_uv[:, 0]))
+            bbox_cy = float(np.mean(corners_uv[:, 1]))
+            norm_dx = abs(bbox_cx - frame_cx) / max(frame_cx, 1.0)
+            norm_dy = abs(bbox_cy - frame_cy) / max(frame_cy, 1.0)
+            center_weight = max(0.2, 1.0 - 0.35 * (norm_dx + norm_dy))
+
+            detections.append(
+                {
+                    "name": "orange_sq",
+                    "conf": float(np.clip((mean_sat - config.ORANGE_SQ_MIN_SAT_MEAN) / 80.0, 0.0, 1.0)),
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "bbox_center": (int(round(bbox_cx)), int(round(bbox_cy))),
+                    "primary_contour": corners_i.reshape(-1, 1, 2),
+                    "outer_contour":   corners_i.reshape(-1, 1, 2),
+                    "depth_contour":   depth_contour,
+                    "depth_bbox":      depth_bbox,
+                    "corners_uv":      corners_uv.astype(np.float32),
+                    "validated_box_like": True,
+                    "score": area * rectangularity * center_weight * max(mean_sat, 1.0),
                 }
             )
 
@@ -1308,7 +1751,8 @@ class DeltaCamera(Node):
         return inter_area / union
 
     def make_track_id(self, name: str, x1: int, y1: int, x2: int, y2: int) -> str:
-        grid = max(1, config.TRACK_GRID_PX)
+        grid = max(1, config.CONVEYOR_TRACK_GRID_PX if config.CONVEYOR_MODE
+                   else config.TRACK_GRID_PX)
         bbox_cu = int((x1 + x2) / 2)
         bbox_cv = int((y1 + y2) / 2)
         return f"{name}_{bbox_cu // grid}_{bbox_cv // grid}"
@@ -1680,6 +2124,33 @@ class DeltaCamera(Node):
             "size_source": size_source,
         }
 
+    def _build_T_cam_to_base(self):
+        """Build the 4×4 homogeneous transform T_cam_to_base.
+
+        p_base = T_cam_to_base @ [p_cam; 1]
+
+        Returns (T_cam_to_base, T_base_to_cam) both as (4,4) float64 arrays.
+        The inverse is computed analytically: T_inv = [[R.T, -R.T @ t], [0,0,0,1]]
+        which avoids numerical error from np.linalg.inv on a rotation matrix.
+        """
+        R = self.build_camera_rotation_matrix()
+        t = np.array([config.CAM_TX_MM, config.CAM_TY_MM, config.CAM_TZ_MM],
+                     dtype=np.float64)
+
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R
+        T[:3,  3] = t
+
+        T_inv = np.eye(4, dtype=np.float64)
+        T_inv[:3, :3] = R.T
+        T_inv[:3,  3] = -R.T @ t
+
+        self.get_logger().info(
+            f"T_cam_to_base built  t=({t[0]:.1f}, {t[1]:.1f}, {t[2]:.1f}) mm  "
+            f"det(R)={np.linalg.det(R):.6f}"
+        )
+        return T, T_inv
+
     def build_camera_rotation_matrix(self):
         legacy = self.legacy_rotation_matrix(config.CAMERA_TRANSFORM_MODE)
 
@@ -1737,7 +2208,7 @@ class DeltaCamera(Node):
             errors.append(f"Y_LIMIT must be > 0, got {config.Y_LIMIT}")
         if config.DEPTH_MIN_M >= config.DEPTH_MAX_M:
             errors.append("DEPTH_MIN_M must be < DEPTH_MAX_M")
-        valid_modes = ("yolo", "white_rectangle", "depth_foreground", "bbox_only")
+        valid_modes = ("yolo", "white_rectangle", "blue_rectangle", "orange_square", "orange_blob", "depth_foreground", "bbox_only")
         if config.DETECTION_MODE.lower() not in valid_modes:
             errors.append(f"DETECTION_MODE '{config.DETECTION_MODE}' not in {valid_modes}")
         if config.CAMERA_USE_DIRECT_MATRIX:
@@ -1887,9 +2358,25 @@ class DeltaCamera(Node):
         }
 
     def camera_to_base_mm(self, x_cam: float, y_cam: float, z_cam: float):
-        camera_xyz = np.array((x_cam, y_cam, z_cam), dtype=np.float64)
-        base_xyz = self.camera_rotation @ camera_xyz + self.camera_translation
-        return float(base_xyz[0]), float(base_xyz[1]), float(base_xyz[2])
+        p_cam = np.array([x_cam, y_cam, z_cam, 1.0], dtype=np.float64)
+        p_base = self.T_cam_to_base @ p_cam
+        return float(p_base[0]), float(p_base[1]), float(p_base[2])
+
+    def _project_base_to_pixel(self, x_b: float, y_b: float, z_b: float):
+        """Project a base-frame point (mm) to image pixel (u, v) via T_base_to_cam
+        and pinhole projection.  Returns None if camera not calibrated or point
+        is behind the camera (z_cam <= 0).
+        """
+        if self.fx is None:
+            return None
+        p_cam = self.T_base_to_cam @ np.array([x_b, y_b, z_b, 1.0], dtype=np.float64)
+        x_c, y_c, z_c = p_cam[:3]
+        if z_c <= 1.0:
+            return None
+        # ratio x_c/z_c is unitless (mm/mm) so fx/fy pixel values work directly
+        u = int(round(self.fx * x_c / z_c + self.cx))
+        v = int(round(self.fy * y_c / z_c + self.cy))
+        return u, v
 
     def camera_to_parallel_mm(self, x_cam: float, y_cam: float, z_cam: float):
         camera_xyz = np.array((x_cam, y_cam, z_cam), dtype=np.float64)
@@ -1899,16 +2386,49 @@ class DeltaCamera(Node):
     def update_xyz_average(self, track_id: str, xyz_now):
         if self.last_track_id != track_id:
             self.xyz_buffer.clear()
+            self._timed_xyz_buf.clear()
             self.last_stable_xyz = None
             self.last_track_id = track_id
 
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
         self.xyz_buffer.append(xyz_now)
+        self._timed_xyz_buf.append((now_sec, xyz_now[0], xyz_now[1], xyz_now[2]))
+
         if len(self.xyz_buffer) < config.AVG_FRAME_COUNT:
             return None
 
         arr = np.array(self.xyz_buffer, dtype=np.float64)
         xyz_avg = np.median(arr, axis=0)
         return float(xyz_avg[0]), float(xyz_avg[1]), float(xyz_avg[2])
+
+    def _estimate_vy(self) -> float:
+        """Estimate conveyor velocity along Y axis (mm/s).
+
+        Uses linear regression over the timed XYZ buffer.  The result is
+        sanity-checked against CONVEYOR_VY_MIN/MAX_MM_S:
+          - Fewer than 3 samples or |vy| < MIN  → belt is stopped, return 0.
+          - |vy| > MAX                           → regression outlier,
+                                                   fall back to design speed.
+        Sign is negative (belt moves in –Y direction).
+        """
+        if len(self._timed_xyz_buf) < 3:
+            return 0.0
+
+        buf = np.array(self._timed_xyz_buf, dtype=np.float64)
+        t   = buf[:, 0] - buf[0, 0]
+        y   = buf[:, 2]
+        A   = np.vstack([t, np.ones(len(t))]).T
+        vy, _ = np.linalg.lstsq(A, y, rcond=None)[0]
+
+        if not config.CONVEYOR_MODE:
+            return float(vy)
+
+        vy_abs = abs(vy)
+        if vy_abs < config.CONVEYOR_VY_MIN_MM_S:
+            return 0.0                              # belt stopped / very slow
+        if vy_abs > config.CONVEYOR_VY_MAX_MM_S:
+            return -config.CONVEYOR_BELT_SPEED_MM_S # outlier → use design speed
+        return float(vy)
 
     def is_stable(self, xyz_avg) -> bool:
         if self.last_stable_xyz is None:
@@ -1928,11 +2448,8 @@ class DeltaCamera(Node):
         return stable
 
     def check_workspace(self, x, y, z):
-        return (
-            abs(x) <= config.X_LIMIT
-            and abs(y) <= config.Y_LIMIT
-            and config.Z_MIN <= z <= config.Z_MAX
-        )
+        from delta_common.fk_ik import check_workspace as fk_check_workspace
+        return fk_check_workspace(x, y, z)
 
     def validate_target(self, x_base, y_base, z_base):
         if not self.check_workspace(x_base, y_base, z_base):
@@ -1973,7 +2490,14 @@ class DeltaCamera(Node):
         self.last_print_time = now
 
         if config.PURE_CAMERA_TEST_ENABLE:
+            if len(self._frame_times) >= 2:
+                dt = self._frame_times[-1] - self._frame_times[0]
+                fps = (len(self._frame_times) - 1) / dt if dt > 0 else 0.0
+            else:
+                fps = 0.0
+            avg_ms = (sum(self._proc_times) / len(self._proc_times) * 1000) if self._proc_times else 0.0
             print("\n========== CAMERA OBJECT ==========")
+            print(f"fps          : {fps:.1f}  proc: {avg_ms:.1f} ms")
             print(f"name         : {best['name']}")
             print(f"conf         : {best['conf']:.2f}")
             print(f"center_uv    : ({best['u']}, {best['v']})")

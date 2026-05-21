@@ -56,12 +56,16 @@ Services
         Start a pick cycle at the configured pick_x/y/z parameter position.
 """
 
+import random
 import threading
 import time
 
+import math
+
 import rclpy
+import rclpy.parameter
 from rclpy.node import Node
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import PointStamped, PoseArray
 from std_msgs.msg import String
 from std_srvs.srv import Empty
 
@@ -72,7 +76,22 @@ from delta_motor_controller.motor_controller import DeltaMotorController
 from delta_motor_controller.pneumatic_gripper import PneumaticGripper
 
 # ── resting / home position ───────────────────────────────────────────────────
-HOME_X, HOME_Y, HOME_Z = 0.0, 0.0, -300.0
+HOME_X, HOME_Y, HOME_Z = 0.0, 0.0, -350.0
+
+# ── speed presets ─────────────────────────────────────────────────────────────
+# Keys: (traj_v_max_mm_s, traj_a_max_mm_s2, motor_vel_rad_s, motor_acc_rad_s2)
+# Motor limits are sized so omega ≈ v_mm_s / rf (rf = 200 mm) with ~2× margin.
+# Columns: (traj_v_max_mm_s, traj_a_max_mm_s2, motor_vel_rad_s, motor_acc_rad_s2, verify_delay_s)
+# verify_delay_s — time to wait after the final waypoint for the motor to settle.
+# Higher ACC means the motor brakes harder and settles faster → shorter delay is safe.
+# Columns: (traj_v_mm_s, traj_a_mm_s2, motor_vel_rad_s, motor_acc_rad_s2, verify_timeout_s)
+# verify_timeout_s is now a MAXIMUM wait — move_xyz exits as soon as the motor
+# settles within POS_TOL_MM, so making this generous costs nothing for fast moves.
+SPEED_PRESETS = {
+    'low':    (  80.0,   200.0,  1.0,   2.0, 0.50),
+    'medium': (2000.0,  5000.0, 25.0,  50.0, 0.50),
+    'max':    (4000.0, 10000.0, 50.0, 100.0, 0.50),
+}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -89,18 +108,48 @@ class BlindPickAndPlace(Node):
 
         # ── declare parameters ────────────────────────────────────────────
         self.declare_parameter('pick_x',              0.0)
-        self.declare_parameter('pick_y',             50.0)
-        self.declare_parameter('pick_z',           -350.0)
-        self.declare_parameter('drop_x',              0.0)
-        self.declare_parameter('drop_y',            -80.0)
-        self.declare_parameter('drop_z',           -300.0)
+        self.declare_parameter('pick_y',             80.0)
+        self.declare_parameter('pick_z',           -380.0)
+        self.declare_parameter('drop_x',             80.0)
+        self.declare_parameter('drop_y',              0.0)
+        self.declare_parameter('drop_z',           -380.0)
         self.declare_parameter('traj_v_max_mm_s',    80.0)
         self.declare_parameter('traj_a_max_mm_s2',  200.0)
         self.declare_parameter('traj_dt_s',           0.05)
-        self.declare_parameter('pneumatic_can_id',   4)
+        self.declare_parameter('pneumatic_can_id',        4)
+        self.declare_parameter('speed_mode',            'low')
+        self.declare_parameter('gripper_length_mm',     120.0)
+        self.declare_parameter('approach_z_offset_mm', 80.0)
+        self.declare_parameter('random_pick_points',    [0.0, 50.0, -350.0])
+        self.declare_parameter('random_place_points',   [0.0, -80.0, -300.0])
+
+        # ── resolve speed preset (overrides traj_v/a params when set) ────
+        mode = self.get_parameter('speed_mode').value
+        if mode in SPEED_PRESETS:
+            v, a, mv, ma, vd = SPEED_PRESETS[mode]
+            self.set_parameters([
+                rclpy.parameter.Parameter('traj_v_max_mm_s',  rclpy.parameter.Parameter.Type.DOUBLE, v),
+                rclpy.parameter.Parameter('traj_a_max_mm_s2', rclpy.parameter.Parameter.Type.DOUBLE, a),
+            ])
+            self.get_logger().info(
+                f'Speed mode: {mode!r}  '
+                f'v={v} mm/s  a={a} mm/s²  '
+                f'motor vel={mv} rad/s  acc={ma} rad/s²  '
+                f'verify_delay={vd} s'
+            )
+        else:
+            self.get_logger().warn(
+                f'Unknown speed_mode {mode!r} — valid: {list(SPEED_PRESETS)}. '
+                f'Using traj_v_max_mm_s / traj_a_max_mm_s2 params as-is.'
+            )
+            v  = self.get_parameter('traj_v_max_mm_s').value
+            a  = self.get_parameter('traj_a_max_mm_s2').value
+            mv, ma, vd = 1.0, 2.0, 0.30
 
         # ── motor controller ──────────────────────────────────────────────
-        self._ctrl = DeltaMotorController(can_port='can0')
+        self._ctrl = DeltaMotorController(can_port='can0', vel_max=mv, acc_set=ma, verify_delay=vd)
+        self._traj_v_max = v
+        self._traj_a_max = a
         if config.ENABLE_MOTORS:
             self._ctrl.connect()
             self.get_logger().info('Motors connected.')
@@ -122,16 +171,81 @@ class BlindPickAndPlace(Node):
         self._srv = self.create_service(
             Empty, '/delta/trigger_pick', self._trigger_cb)
 
-        # ── subscription ─────────────────────────────────────────────────
+        # ── subscriptions ────────────────────────────────────────────────
+        # manual target from UI (mm, static object)
         self._sub = self.create_subscription(
             PointStamped, '/delta/blind_target', self._target_cb, 10)
+        # camera target (meters, converted internally; prediction applied)
+        self._sub_cam = self.create_subscription(
+            PointStamped, '/delta/target_xyz', self._camera_target_cb, 10)
+        # conveyor velocity from camera (mm/s, point.y = vy)
+        self._sub_vel = self.create_subscription(
+            PointStamped, '/delta/object_velocity_mm_s', self._velocity_cb, 10)
+        # multi-target array from camera (meters, robot base frame)
+        self._sub_all = self.create_subscription(
+            PoseArray, '/delta/all_targets', self._all_targets_cb, 10)
+
+        # ── service: stop random cycling ─────────────────────────────────
+        self._srv_random = self.create_service(
+            Empty, '/delta/trigger_random', self._trigger_random_cb)
+        self._srv_stop = self.create_service(
+            Empty, '/delta/stop_random', self._stop_random_cb)
+
+        # ── random point lists (set via UI / set_parameters) ──────────────
+        self._pick_points  = []   # list of (x, y, z)
+        self._place_points = []   # list of (x, y, z)
+
+        # ── conveyor velocity cache ───────────────────────────────────────
+        self._vy = 0.0   # mm/s along Y axis, updated by camera
+
+        # ── multi-target snapshot (latest PoseArray from camera, in mm) ──
+        self._latest_targets: list = []
+        self._targets_lock = threading.Lock()
 
         # ── FSM state ─────────────────────────────────────────────────────
         self._busy = False
         self._lock = threading.Lock()
+        self._random_stop = threading.Event()
+
+        # ── parameter callback — re-apply motor speed on speed_mode change ─
+        self.add_on_set_parameters_callback(self._on_params_changed)
 
         self._publish_state('IDLE')
         self.get_logger().info('BlindPickAndPlace ready — waiting for trigger.')
+
+    # ── parameter callback ────────────────────────────────────────────────────
+
+    def _on_params_changed(self, params):
+        from rcl_interfaces.msg import SetParametersResult
+        for p in params:
+            if p.name == 'speed_mode' and p.value in SPEED_PRESETS:
+                v, a, mv, ma, vd = SPEED_PRESETS[p.value]
+                self._traj_v_max = v
+                self._traj_a_max = a
+                self._ctrl.VEL_MAX = mv
+                self._ctrl.ACC_SET = ma
+                self._ctrl.VERIFY_DELAY = vd
+                if config.ENABLE_MOTORS:
+                    self._ctrl.setup_pp_mode()
+                self.get_logger().info(
+                    f'Speed mode → {p.value!r}  '
+                    f'v={v} mm/s  a={a} mm/s²  motor vel={mv} rad/s  acc={ma} rad/s²'
+                )
+            elif p.name == 'random_pick_points':
+                flat = list(p.value)
+                if len(flat) % 3 == 0 and len(flat) >= 3:
+                    self._pick_points = [
+                        (flat[i], flat[i+1], flat[i+2]) for i in range(0, len(flat), 3)
+                    ]
+                    self.get_logger().info(f'Pick points updated: {self._pick_points}')
+            elif p.name == 'random_place_points':
+                flat = list(p.value)
+                if len(flat) % 3 == 0 and len(flat) >= 3:
+                    self._place_points = [
+                        (flat[i], flat[i+1], flat[i+2]) for i in range(0, len(flat), 3)
+                    ]
+                    self.get_logger().info(f'Place points updated: {self._place_points}')
+        return SetParametersResult(successful=True)
 
     # ── ROS callbacks ─────────────────────────────────────────────────────────
 
@@ -147,7 +261,7 @@ class BlindPickAndPlace(Node):
         return resp
 
     def _target_cb(self, msg: PointStamped) -> None:
-        """Topic: pick at the (x, y, z) given in the message (mm, base frame)."""
+        """Manual UI target (mm, static object — no prediction)."""
         pos = (msg.point.x, msg.point.y, msg.point.z)
         if not check_workspace(*pos):
             self.get_logger().warn(
@@ -155,6 +269,171 @@ class BlindPickAndPlace(Node):
                 f'is outside workspace — ignored')
             return
         self._maybe_start(pos)
+
+    def _velocity_cb(self, msg: PointStamped) -> None:
+        """Cache the latest conveyor velocity from the camera (mm/s, Y axis)."""
+        self._vy = msg.point.y
+
+    def _camera_target_cb(self, msg: PointStamped) -> None:
+        """Camera detection target: meters → mm, predict Y forward by travel time."""
+        x_mm = msg.point.x * 1000.0
+        y_mm = msg.point.y * 1000.0
+        z_mm = msg.point.z * 1000.0
+
+        if not check_workspace(x_mm, y_mm, z_mm):
+            return
+
+        # predict where the object will be when the gripper arrives
+        gl   = self.get_parameter('gripper_length_mm').value
+        zoff = self.get_parameter('approach_z_offset_mm').value
+        home = (HOME_X, HOME_Y, HOME_Z)
+        eff_z = z_mm + gl
+
+        v_max = self._traj_v_max
+        a_max = self._traj_a_max
+        above = (x_mm, y_mm, min(eff_z + zoff, config.Z_MAX))
+
+        # first-pass travel time estimate: home → above_pick → pick
+        t_est = (self._travel_time(home, above, v_max, a_max) +
+                 self._travel_time(above, (x_mm, y_mm, eff_z), v_max, a_max))
+
+        # one refinement: project Y and recompute
+        y_pred   = y_mm + self._vy * t_est
+        above2   = (x_mm, y_pred, max(eff_z + zoff, config.Z_MAX))
+        t_est    = (self._travel_time(home, above2, v_max, a_max) +
+                    self._travel_time(above2, (x_mm, y_pred, eff_z), v_max, a_max))
+        y_pred   = y_mm + self._vy * t_est
+
+        predicted = (x_mm, y_pred, z_mm)
+        if not check_workspace(*predicted):
+            self.get_logger().warn(
+                f'Predicted pick Y={y_pred:.1f} mm leaves workspace — skipped '
+                f'(vy={self._vy:.0f} mm/s  t={t_est:.3f} s)')
+            return
+
+        self.get_logger().info(
+            f'Camera pick: detected Y={y_mm:.1f}  predicted Y={y_pred:.1f}'
+            f'  vy={self._vy:.0f} mm/s  t={t_est:.3f} s')
+        self._maybe_start(predicted)
+
+    @staticmethod
+    def _travel_time(frm, to, v_max: float, a_max: float) -> float:
+        """Trapezoidal profile travel time between two 3-D points."""
+        d = math.sqrt(sum((b - a) ** 2 for a, b in zip(frm, to)))
+        if d < 1e-6:
+            return 0.0
+        d_acc = v_max ** 2 / a_max          # distance covered during accel + decel
+        if d >= d_acc:
+            return d / v_max + v_max / a_max
+        return 2.0 * math.sqrt(d / a_max)   # short move: no cruise phase
+
+    def _trigger_random_cb(self, _req, resp):
+        if not self._pick_points or not self._place_points:
+            self.get_logger().warn(
+                'Random trigger ignored — no pick/place points set. '
+                'Use the UI to define points first.')
+            return resp
+        self._random_stop.clear()
+        threading.Thread(target=self._run_random_cycles, daemon=True).start()
+        return resp
+
+    def _stop_random_cb(self, _req, resp):
+        self._random_stop.set()
+        self.get_logger().info('Random cycling stop requested.')
+        return resp
+
+    # ── multi-target callbacks ─────────────────────────────────────────────────
+
+    def _all_targets_cb(self, msg: PoseArray) -> None:
+        """Cache all camera-confirmed targets (meters → mm) and dispatch if idle."""
+        targets = [
+            {'x_mm': p.position.x * 1000.0,
+             'y_mm': p.position.y * 1000.0,
+             'z_mm': p.position.z * 1000.0}
+            for p in msg.poses
+        ]
+        with self._targets_lock:
+            self._latest_targets = targets
+        self._dispatch_next()
+
+    def _predict_pick(self, x_mm: float, y_mm: float, z_mm: float):
+        """Apply conveyor-travel prediction; return predicted (x, y, z) mm or None."""
+        gl    = self.get_parameter('gripper_length_mm').value
+        zoff  = self.get_parameter('approach_z_offset_mm').value
+        v_max = self._traj_v_max
+        a_max = self._traj_a_max
+        home  = (HOME_X, HOME_Y, HOME_Z)
+        eff_z = z_mm + gl
+        approach_z = min(eff_z + zoff, config.Z_MAX)
+
+        above  = (x_mm, y_mm, approach_z)
+        t_est  = (self._travel_time(home, above, v_max, a_max) +
+                  self._travel_time(above, (x_mm, y_mm, eff_z), v_max, a_max))
+        y_pred = y_mm + self._vy * t_est
+
+        above2 = (x_mm, y_pred, approach_z)
+        t_est  = (self._travel_time(home, above2, v_max, a_max) +
+                  self._travel_time(above2, (x_mm, y_pred, eff_z), v_max, a_max))
+        y_pred = y_mm + self._vy * t_est
+
+        predicted = (x_mm, y_pred, z_mm)
+        if not check_workspace(*predicted):
+            return None
+        return predicted
+
+    def _dispatch_next(self) -> None:
+        """When idle, pick the highest-priority target from the latest camera snapshot.
+
+        Priority = "first to exit workspace":
+          - Conveyor moves in -Y → object with lowest predicted Y exits first.
+          - Static/slow belt → closest to HOME goes first (minimises travel time).
+        """
+        with self._targets_lock:
+            targets = list(self._latest_targets)
+
+        if not targets:
+            return
+
+        candidates = []
+        for t in targets:
+            predicted = self._predict_pick(t['x_mm'], t['y_mm'], t['z_mm'])
+            if predicted is None:
+                continue
+            vy = self._vy
+            if abs(vy) > 1.0:
+                # "first to exit" — most extreme Y in direction of belt travel wins
+                priority = predicted[1] * (1.0 if vy >= 0.0 else -1.0)
+            else:
+                # static: closest to home
+                priority = -math.sqrt(sum((a - b) ** 2 for a, b in
+                                         zip(predicted, (HOME_X, HOME_Y, HOME_Z))))
+            candidates.append((priority, predicted))
+
+        if not candidates:
+            return
+
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        _, pick_xyz = candidates[0]
+        self.get_logger().info(
+            f'[DISPATCH]  {len(candidates)} valid target(s) — '
+            f'picking ({pick_xyz[0]:.1f}, {pick_xyz[1]:.1f}, {pick_xyz[2]:.1f}) mm'
+        )
+        self._maybe_start(pick_xyz)
+
+    def _run_random_cycles(self):
+        log = self.get_logger()
+        log.info(
+            f'Random cycling started — '
+            f'{len(self._pick_points)} pick pts, '
+            f'{len(self._place_points)} place pts')
+        while not self._random_stop.is_set():
+            pick  = random.choice(self._pick_points)
+            place = random.choice(self._place_points)
+            log.info(f'Random: pick={pick}  place={place}')
+            self._run_one(pick, place)
+            if self._random_stop.is_set():
+                break
+        log.info('Random cycling stopped.')
 
     # ── sequence management ───────────────────────────────────────────────────
 
@@ -165,46 +444,79 @@ class BlindPickAndPlace(Node):
                     'Already executing a sequence — new trigger dropped')
                 return
             self._busy = True
+        p = self.get_parameter
+        place = (p('drop_x').value, p('drop_y').value, p('drop_z').value)
         threading.Thread(
-            target=self._run_sequence, args=(pick_xyz,), daemon=True
+            target=self._run_one, args=(pick_xyz, place), daemon=True
         ).start()
 
-    def _run_sequence(self, pick_xyz) -> None:
-        """4-waypoint pick-and-place sequence.  Runs in a background thread.
+    def _run_one(self, pick_xyz, place_xyz) -> None:
+        """Single pick-and-place cycle.
 
-        Waypoints: HOME → PICK (close gripper) → PLACE (open gripper) → HOME
+        Transit strategy: always move through the centre column (HOME_X, HOME_Y)
+        at a transit Z that is deep enough for the full workspace to be open (≥200 mm
+        radius in every direction).  This avoids the non-convex ceiling gaps that
+        make diagonal paths unreachable when pick/place are far from centre.
+
+        Path:
+          HOME
+            ↓ (HOME_X, HOME_Y, transit_z)    — descend at centre
+            → (pick_x,  pick_y,  transit_z)  — lateral traverse at safe depth
+            ↓ pick_xyz                        — final descent (if deeper than transit)
+          GRASP
+            ↑ (pick_x,  pick_y,  transit_z)  — rise back to transit Z
+            → (HOME_X,  HOME_Y,  transit_z)  — return to centre column
+            → (place_x, place_y, transit_z)  — traverse to place
+            ↓ place_xyz                       — final descent
+          DROP
+            ↑ (place_x, place_y, transit_z)  — rise
+            → (HOME_X,  HOME_Y,  transit_z)  — centre column
+            ↑ HOME                            — ascend to home
         """
-        log = self.get_logger()
-        p = self.get_parameter
-
-        place = (p('drop_x').value, p('drop_y').value, p('drop_z').value)
-        v_max = p('traj_v_max_mm_s').value
-        a_max = p('traj_a_max_mm_s2').value
-        dt    = p('traj_dt_s').value
+        log   = self.get_logger()
+        v_max = self._traj_v_max
+        a_max = self._traj_a_max
+        dt    = self.get_parameter('traj_dt_s').value
         home  = (HOME_X, HOME_Y, HOME_Z)
 
-        try:
-            # ── 1. MOVING_TO_PICK — home → pick position ──────────────────
-            self._publish_state('MOVING_TO_PICK')
-            log.info(f'[MOVING_TO_PICK]  {home} → {pick_xyz}')
-            wps = linear_waypoints(home, pick_xyz, v_max=v_max, a_max=a_max, dt=dt)
-            if not self._ctrl.execute_trajectory(wps, dt=dt):
-                raise RuntimeError('MOVING_TO_PICK trajectory did not reach target')
+        # At Z ≤ -400 the workspace radius is ≥ 200 mm in every direction,
+        # so any lateral move at transit_z is safe.
+        SAFE_TRANSIT_Z = -400.0
+        transit_z = min(pick_xyz[2], place_xyz[2], SAFE_TRANSIT_Z)
 
-            # ── 2. GRASPING — energize pneumatic solenoid ─────────────────
+        home_t  = (HOME_X,      HOME_Y,      transit_z)
+        pick_t  = (pick_xyz[0], pick_xyz[1], transit_z)
+        place_t = (place_xyz[0], place_xyz[1], transit_z)
+
+        with self._lock:
+            self._busy = True
+
+        def move(label, frm, to):
+            wps = linear_waypoints(frm, to, v_max=v_max, a_max=a_max, dt=dt)
+            if not self._ctrl.execute_trajectory(wps, dt=dt):
+                raise RuntimeError(f'{label} trajectory did not reach target')
+
+        try:
+            self._publish_state('MOVING_TO_PICK')
+            log.info(
+                f'[MOVING_TO_PICK]  {home} → {home_t} → {pick_t} → {pick_xyz}')
+            move('home→home_t',   home,   home_t)
+            move('home_t→pick_t', home_t, pick_t)
+            move('pick_t→pick',   pick_t, pick_xyz)
+
             self._publish_state('GRASPING')
             log.info('[GRASPING]  closing gripper')
             if config.ENABLE_MOTORS:
                 self._gripper.close(wait=True)
 
-            # ── 3. MOVING_TO_PLACE — pick position → place position ───────
             self._publish_state('MOVING_TO_PLACE')
-            log.info(f'[MOVING_TO_PLACE]  {pick_xyz} → {place}')
-            wps = linear_waypoints(pick_xyz, place, v_max=v_max, a_max=a_max, dt=dt)
-            if not self._ctrl.execute_trajectory(wps, dt=dt):
-                raise RuntimeError('MOVING_TO_PLACE trajectory did not reach target')
+            log.info(
+                f'[MOVING_TO_PLACE]  {pick_xyz} → {pick_t} → {home_t} → {place_t} → {place_xyz}')
+            move('pick→pick_t',    pick_xyz, pick_t)
+            move('pick_t→home_t',  pick_t,   home_t)
+            move('home_t→place_t', home_t,   place_t)
+            move('place_t→place',  place_t,  place_xyz)
 
-            # ── 4. DROPPING — de-energize solenoid ────────────────────────
             self._publish_state('DROPPING')
             log.info('[DROPPING]  opening gripper')
             if config.ENABLE_MOTORS:
@@ -213,24 +525,26 @@ class BlindPickAndPlace(Node):
         except Exception as exc:
             log.error(f'Sequence aborted: {type(exc).__name__}: {exc}')
             if config.ENABLE_MOTORS:
-                self._gripper.open(wait=False)   # safety: release on any failure
+                self._gripper.open(wait=False)
 
         finally:
-            # ── 5. RESETTING — return arm to home position ────────────────
             self._publish_state('RESETTING')
             try:
                 ok, cx, cy, cz = self._ctrl.get_current_xyz()
-                current = (cx, cy, cz) if ok else place
-                log.info(f'[RESETTING]  returning home {home}')
-                wps = linear_waypoints(current, home, v_max=v_max, a_max=a_max, dt=dt)
-                self._ctrl.execute_trajectory(wps, dt=dt)
+                current = (cx, cy, cz) if ok else home_t
+                cur_t   = (current[0], current[1], transit_z)
+                log.info(f'[RESETTING]  returning home via transit_z={transit_z}')
+                move('reset→cur_t', current, cur_t)
+                move('cur_t→home_t', cur_t,   home_t)
+                move('home_t→home',  home_t,  home)
             except Exception as exc:
                 log.error(f'RESETTING failed: {exc}')
 
             with self._lock:
                 self._busy = False
             self._publish_state('IDLE')
-            log.info('Sequence complete — IDLE')
+            log.info('Cycle complete — IDLE')
+            self._dispatch_next()
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

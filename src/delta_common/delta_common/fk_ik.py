@@ -123,11 +123,19 @@ def delta_calcInverse(x0, y0, z0, e, f, re, rf):
 
 
 def check_workspace(x_mm: float, y_mm: float, z_mm: float) -> bool:
-    """Return True if (x, y, z) in mm is within the configured robot workspace."""
+    """Return True if (x, y, z) in mm is within the configured robot workspace.
+
+    The bounding box (X_LIMIT / Y_LIMIT / Z_MIN / Z_MAX) is a rectangular
+    over-approximation.  Corners of the box (large XY + Z near ceiling) are
+    outside the actual reachable sphere, so we also verify IK feasibility.
+    """
     from delta_common import config
 
-    return (
+    if not (
         abs(x_mm) <= config.X_LIMIT
         and abs(y_mm) <= config.Y_LIMIT
         and config.Z_MIN <= z_mm <= config.Z_MAX
-    )
+    ):
+        return False
+    st, _, _, _ = delta_calcInverse(x_mm, y_mm, z_mm, e, f, re, rf)
+    return st == 0

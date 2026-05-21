@@ -23,9 +23,14 @@ setup(
     license='Apache License 2.0',
     entry_points={
         'console_scripts': [
-            'main_app        = delta_main_app.main_app:main',
-            'blind_pick_place = delta_main_app.blind_pick_place:main',
-            'pick_place_ui    = delta_main_app.pick_place_ui:main',
+            'main_app             = delta_main_app.main_app:main',
+            'blind_pick_place     = delta_main_app.blind_pick_place:main',
+            'pick_place_ui        = delta_main_app.pick_place_ui:main',
+            'laser_accuracy_experiment = delta_main_app.laser_accuracy_experiment:main',
+            'analyze_repeatability     = delta_main_app.analyze_repeatability:main',
+            'laser_preview             = delta_main_app.laser_preview:main',
+            'repeatability_test        = delta_main_app.repeatability_test:main',
+            'workspace_accuracy_sweep  = delta_main_app.workspace_accuracy_sweep:main',
         ],
     },
 )

@@ -29,7 +29,7 @@ import threading
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import PointStamped, PoseArray
 from std_msgs.msg import Float32, String
 
 from delta_common import config
@@ -41,21 +41,18 @@ from delta_motor_controller.motor_controller import DeltaMotorController
 # i.e. between -500.0 and -196.875 mm.
 # The helpers _approach_z() and _lift_z() clamp automatically.
 
-APPROACH_Z_OFFSET = 50.0
-LIFT_Z_OFFSET = 70.0
-DROP_X = 0.0
-DROP_Y = 100.0
-DROP_Z = -280.0
+APPROACH_Z_OFFSET = 25.0
+LIFT_Z_OFFSET = 30.0
 HOME_X = 0.0
 HOME_Y = 0.0
-HOME_Z = -300.0
+HOME_Z = -350.0
 
 GRASP_WAIT_SEC = 0.4
 DROP_WAIT_SEC = 0.4
 MOVE_SETTLE_SEC = 0.1
 
-CONFIRM_FRAMES = 3
-STABLE_THRESH_MM = 6.0
+CONFIRM_FRAMES = 2
+STABLE_THRESH_MM = 10.0
 
 
 def _clamp_z(z: float) -> float:
@@ -138,6 +135,18 @@ class PickAndPlaceStateMachine:
                     )
                     self._start_sequence()
 
+    def force_target(self, x: float, y: float, z: float) -> bool:
+        """Start a pick sequence immediately, bypassing confirmation.
+        Camera already confirmed the target — no need to buffer frames.
+        Returns False if the robot is currently busy."""
+        with self._lock:
+            if self._busy:
+                return False
+            self._target_xyz = (x, y, z)
+            self._log.info(f"Queue target: ({x:.1f}, {y:.1f}, {z:.1f}) mm")
+            self._start_sequence()
+            return True
+
     def no_detection(self) -> None:
         with self._lock:
             if self._busy:
@@ -170,16 +179,24 @@ class PickAndPlaceStateMachine:
         threading.Thread(target=self._run_sequence, daemon=True).start()
 
     def _run_sequence(self) -> None:
+        from delta_common.fk_ik import delta_calcInverse, e, f, re, rf
+
         x, y, z = self._target_xyz
 
         az = _approach_z(z)
         lz = _lift_z(z)
 
-        if az != z + APPROACH_Z_OFFSET:
+        # At offset XY positions, the shallow approach Z may be outside the
+        # reachable workspace (delta workspace shrinks near the ceiling).
+        # If approach has no IK solution, skip it and go straight to pick depth.
+        st_az, *_ = delta_calcInverse(x, y, az, e, f, re, rf)
+        use_approach = (st_az == 0)
+        if not use_approach:
             self._log.warn(
-                f"Approach Z clamped: {z + APPROACH_Z_OFFSET:.1f} -> {az:.1f} mm "
-                f"(Z_MAX={config.Z_MAX:.1f}) - object is near top of workspace"
+                f"Approach Z={az:.1f} unreachable at XY=({x:.1f},{y:.1f}) "
+                f"— skipping approach, descending directly to Z={z:.1f}"
             )
+
         if lz != z + LIFT_Z_OFFSET:
             self._log.warn(
                 f"Lift Z clamped: {z + LIFT_Z_OFFSET:.1f} -> {lz:.1f} mm "
@@ -188,9 +205,10 @@ class PickAndPlaceStateMachine:
 
         try:
             self._set_state("APPROACHING")
-            if not self._move(x, y, az):
-                raise RuntimeError("APPROACH failed")
-            time.sleep(MOVE_SETTLE_SEC)
+            if use_approach:
+                if not self._move(x, y, az):
+                    raise RuntimeError("APPROACH failed")
+                time.sleep(MOVE_SETTLE_SEC)
 
             self._set_state("PICKING")
             if not self._move(x, y, z):
@@ -207,7 +225,7 @@ class PickAndPlaceStateMachine:
             time.sleep(MOVE_SETTLE_SEC)
 
             self._set_state("TRANSPORTING")
-            if not self._move(DROP_X, DROP_Y, DROP_Z):
+            if not self._move(config.PLACE_X, config.PLACE_Y, config.PLACE_Z):
                 raise RuntimeError("TRANSPORT failed")
             time.sleep(MOVE_SETTLE_SEC)
 
@@ -221,7 +239,7 @@ class PickAndPlaceStateMachine:
 
         finally:
             self._set_state("RESETTING")
-            self._move(HOME_X, HOME_Y, HOME_Z)
+            self._move(HOME_X, HOME_Y, HOME_Z, raw=True)
 
             with self._lock:
                 self._state = "IDLE"
@@ -231,7 +249,7 @@ class PickAndPlaceStateMachine:
             self._publish_state()
             self._log.info("Sequence complete - IDLE")
 
-    def _move(self, x: float, y: float, z: float) -> bool:
+    def _move(self, x: float, y: float, z: float, raw: bool = False) -> bool:
         from delta_common.fk_ik import delta_calcInverse, e, f, re, rf
 
         st, t1, t2, t3 = delta_calcInverse(x, y, z, e, f, re, rf)
@@ -249,7 +267,7 @@ class PickAndPlaceStateMachine:
             f"  Move ({x:.1f}, {y:.1f}, {z:.1f})  "
             f"theta=({t1:.1f}, {t2:.1f}, {t3:.1f})"
         )
-        ok, ik_deg, fb_deg, fk_xyz, err = self._ctrl.move_xyz(x, y, z)
+        ok, ik_deg, fb_deg, fk_xyz, err = self._ctrl.move_xyz(x, y, z, raw=raw)
         if ok:
             self._log.info(f"  FK err={err:.2f} mm  OK")
         else:
@@ -290,26 +308,60 @@ class DeltaMainApp(Node):
             logger=self.get_logger(),
         )
 
-        self._sub_target = self.create_subscription(
-            PointStamped, "/delta/target_xyz", self._target_callback, 10
+        self._target_queue: list = []
+        self._belt_vy_mm_s: float = 0.0
+        self._queue_lock = threading.Lock()
+
+        self._sub_all_targets = self.create_subscription(
+            PoseArray, "/delta/all_targets", self._all_targets_callback, 10
+        )
+        self._sub_velocity = self.create_subscription(
+            PointStamped, "/delta/object_velocity_mm_s", self._velocity_callback, 10
         )
         self._sub_status = self.create_subscription(
             String, "/delta/detection_status", self._status_callback, 10
         )
+        self.create_timer(0.1, self._queue_timer)
 
         self.get_logger().info(
             f"DeltaMainApp ready  "
             f"Z_workspace=[{config.Z_MIN:.0f}, {config.Z_MAX:.0f}] mm  "
-            f"theta>=0 constraint active"
+            f"place=({config.PLACE_X:.0f}, {config.PLACE_Y:.0f}, {config.PLACE_Z:.0f}) mm"
         )
 
-    def _target_callback(self, msg: PointStamped) -> None:
-        if config.VISION_ONLY_ENABLE:
-            return
-        x, y, z = msg.point.x, msg.point.y, msg.point.z
-        if not check_workspace(x, y, z):
-            return
-        self._fsm.detection_update(x, y, z)
+    def _all_targets_callback(self, msg: PoseArray) -> None:
+        with self._queue_lock:
+            if self._fsm.state != "IDLE":
+                return
+            if self._target_queue:
+                return
+            candidates = [
+                (p.position.x * 1000.0, p.position.y * 1000.0, p.position.z * 1000.0)
+                for p in msg.poses
+            ]
+            if not candidates:
+                return
+            candidates.sort(key=lambda p: math.sqrt(p[0] ** 2 + p[1] ** 2))
+            self._target_queue = candidates
+            self.get_logger().info(f"Queued {len(candidates)} target(s)")
+
+    def _velocity_callback(self, msg: PointStamped) -> None:
+        self._belt_vy_mm_s = msg.point.y
+
+    def _queue_timer(self) -> None:
+        with self._queue_lock:
+            if self._fsm.state != "IDLE" or not self._target_queue:
+                return
+            x, y, z = self._target_queue.pop(0)
+            dist_mm = math.sqrt(x ** 2 + y ** 2)
+            t_travel = dist_mm / max(config.ROBOT_SPEED_MM_S, 1.0)
+            y_pred = y + self._belt_vy_mm_s * t_travel
+            if not check_workspace(x, y_pred, z):
+                self.get_logger().warn(
+                    f"Predicted pick ({x:.1f}, {y_pred:.1f}, {z:.1f}) outside workspace — skipped"
+                )
+                return
+            self._fsm.force_target(x, y_pred, z)
 
     def _status_callback(self, msg: String) -> None:
         if "NO_DETECTION" in msg.data or "LOST" in msg.data:

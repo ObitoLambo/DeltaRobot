@@ -17,7 +17,7 @@ except ImportError:
 
 
 class DeltaMotorController:
-    def __init__(self, can_port="can0"):
+    def __init__(self, can_port="can0", vel_max=1.0, acc_set=2.0, verify_delay=1.50):
         self.CAN_PORT = can_port
         self.connected = False
         self._shutdown_done = False
@@ -25,11 +25,11 @@ class DeltaMotorController:
         self.MOTOR_IDS = [1, 2, 3]
         self.MOTOR_NAMES = [f"motor_{mid}" for mid in self.MOTOR_IDS]
 
-        self.VEL_MAX = 1.0
-        self.ACC_SET = 2.0
+        self.VEL_MAX = vel_max
+        self.ACC_SET = acc_set
 
-        self.VERIFY_DELAY = 0.30
-        self.POS_TOL_MM = 2.0
+        self.VERIFY_DELAY = verify_delay
+        self.POS_TOL_MM = 0.5
 
         motors = {
             name: Motor(id=mid, model="rs-00")
@@ -73,8 +73,19 @@ class DeltaMotorController:
             self.bus.write(name, ParameterType.POSITION_TARGET, 0.0)
         time.sleep(1.0)
 
-    def move_xyz(self, x, y, z):
+    def move_xyz(self, x, y, z, raw=False):
         print(f"\nXYZ -> ({x:.2f}, {y:.2f}, {z:.2f})")
+        if not raw:
+            if config.ERROR_MAP_ENABLE:
+                from delta_common import error_map as _em
+                cx, cy, cz = _em.correction(x, y, z, config.ERROR_MAP_FILE)
+                x += cx; y += cy; z += cz
+                print(f"Map correction ({cx:+.2f},{cy:+.2f},{cz:+.2f}) -> ({x:.2f}, {y:.2f}, {z:.2f})")
+            elif config.EE_OFFSET_X_MM or config.EE_OFFSET_Y_MM or config.EE_OFFSET_Z_MM:
+                x += config.EE_OFFSET_X_MM
+                y += config.EE_OFFSET_Y_MM
+                z += config.EE_OFFSET_Z_MM
+                print(f"EE offset applied -> ({x:.2f}, {y:.2f}, {z:.2f})")
 
         if not check_workspace(x, y, z):
             print(f"Workspace reject: XYZ=({x:.1f},{y:.1f},{z:.1f}) outside limits")
@@ -95,23 +106,43 @@ class DeltaMotorController:
         for name, rad in zip(self.MOTOR_NAMES, target_radians):
             self.bus.write(name, ParameterType.POSITION_TARGET, float(rad))
 
-        time.sleep(self.VERIFY_DELAY)
+        # Poll until the motor settles within tolerance or the timeout expires.
+        # VERIFY_DELAY is the maximum wait; we exit early once the FK error is
+        # within POS_TOL_MM.  This handles the variation in settle time across
+        # speed presets without either timing out too early (max speed) or
+        # waiting too long (low speed).
+        POLL_INTERVAL = 0.020   # 50 Hz poll rate
+        deadline = time.time() + self.VERIFY_DELAY
+        fb_deg = None
+        fk_xyz = None
+        err    = float('inf')
 
-        feedback_radians = [
-            float(self.bus.read(name, ParameterType.MECHANICAL_POSITION))
-            for name in self.MOTOR_NAMES
-        ]
-        fb_deg = tuple(math.degrees(value) for value in feedback_radians)
+        while True:
+            time.sleep(POLL_INTERVAL)
 
-        st_fk, x_fk, y_fk, z_fk = delta_calcForward(
-            fb_deg[0], fb_deg[1], fb_deg[2], e, f, re, rf
-        )
-        if st_fk != 0:
-            print("FK failed")
-            return False, ik_deg, fb_deg, None, None
+            feedback_radians = [
+                float(self.bus.read(name, ParameterType.MECHANICAL_POSITION))
+                for name in self.MOTOR_NAMES
+            ]
+            fb_deg = tuple(math.degrees(v) for v in feedback_radians)
 
-        fk_xyz = (x_fk, y_fk, z_fk)
-        err = math.sqrt((x - x_fk) ** 2 + (y - y_fk) ** 2 + (z - z_fk) ** 2)
+            st_fk, x_fk, y_fk, z_fk = delta_calcForward(
+                fb_deg[0], fb_deg[1], fb_deg[2], e, f, re, rf
+            )
+            if st_fk != 0:
+                if time.time() >= deadline:
+                    print("FK failed")
+                    return False, ik_deg, fb_deg, None, None
+                continue
+
+            fk_xyz = (x_fk, y_fk, z_fk)
+            err = math.sqrt((x - x_fk) ** 2 + (y - y_fk) ** 2 + (z - z_fk) ** 2)
+
+            if err < self.POS_TOL_MM:
+                break                    # settled — exit early
+
+            if time.time() >= deadline:
+                break                    # timeout — report whatever error we have
 
         print(f"FK = ({x_fk:.2f}, {y_fk:.2f}, {z_fk:.2f}) | err={err:.2f} mm")
 

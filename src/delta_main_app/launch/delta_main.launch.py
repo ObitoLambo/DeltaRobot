@@ -1,4 +1,5 @@
 # CHANGES: [D455 default] disable accel/gyro IMU, set conservative 640x480x15 profiles
+# CHANGES: [D455 default] disable accel/gyro IMU, set conservative 640x480x15 profiles
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -28,6 +29,12 @@ def generate_launch_description():
         output="screen",
     )
 
+    camera_node = Node(
+        package="delta_camera_system",
+        executable="camera_node",
+        output="screen",
+    )
+
     main_app = Node(
         package="delta_main_app",
         executable="main_app",
@@ -42,5 +49,6 @@ def generate_launch_description():
         DeclareLaunchArgument("enable_gyro", default_value="false"),
         DeclareLaunchArgument("unite_imu_method", default_value="0"),
         realsense,
+        camera_node,
         main_app,
     ])

@@ -3,7 +3,7 @@ COLOR_TOPIC = "/camera/camera/color/image_raw"
 DEPTH_TOPIC = "/camera/camera/aligned_depth_to_color/image_raw"
 CAMERA_INFO_TOPIC = "/camera/camera/color/camera_info"
 
-DETECTION_MODE = "white_rectangle"
+DETECTION_MODE = "orange_blob"
 YOLO_MODEL = "yolo11n.pt"
 YOLO_IMGSZ = 1280
 YOLO_IOU = 0.45
@@ -19,8 +19,8 @@ DRAW_DETECTION_CORNERS = False
 DRAW_OBJECT_SIZE_LABEL = False
 REQUIRE_FULL_BBOX_IN_FRAME = True
 FRAME_MARGIN_PX = 12
-DETECT_ONLY_IN_WORKSPACE = False
-DRAW_REJECTED_DETECTIONS = True
+DETECT_ONLY_IN_WORKSPACE = True
+DRAW_REJECTED_DETECTIONS = False
 BBOX_LABEL = "box"
 BBOX_FRAME_MIN_AREA = 2500.0
 BBOX_FRAME_MAX_AREA_RATIO = 0.70
@@ -30,13 +30,58 @@ BBOX_NMS_IOU = 0.35
 CANNY_LOW = 60
 CANNY_HIGH = 180
 
+BLUE_RECT_HUE_LOW  = 100       # OpenCV H (0-180): start of blue band
+BLUE_RECT_HUE_HIGH = 130       # end of blue band
+BLUE_RECT_SAT_MIN  = 80        # minimum saturation — rejects washed-out / gray regions
+BLUE_RECT_VAL_MIN  = 50        # minimum value — rejects near-black shadows
+BLUE_RECT_MIN_SAT_MEAN   = 100.0   # mean saturation inside contour (replaces contrast check)
+BLUE_RECT_MIN_AREA_PX    = 600.0
+BLUE_RECT_MAX_AREA_RATIO = 0.12
+BLUE_RECT_MIN_WIDTH_PX   = 24
+BLUE_RECT_MIN_HEIGHT_PX  = 24
+BLUE_RECT_BORDER_REJECT_PX     = 10
+BLUE_RECT_MASK_OPEN_PX         = 3
+BLUE_RECT_MASK_CLOSE_PX        = 7
+BLUE_RECT_POLY_EPSILON_SCALE   = 0.05
+BLUE_RECT_MIN_RECTANGULARITY   = 0.76
+BLUE_RECT_MIN_ASPECT_RATIO     = 1.05
+BLUE_RECT_MAX_ASPECT_RATIO     = 4.50
+
+ORANGE_SQ_HUE_LOW  = 5        # OpenCV H (0-180): start of orange band
+ORANGE_SQ_HUE_HIGH = 30       # end of orange band
+ORANGE_SQ_SAT_MIN  = 120      # reject washed-out / gray
+ORANGE_SQ_VAL_MIN  = 80       # reject near-black shadows
+ORANGE_SQ_MIN_SAT_MEAN        = 100.0
+
+# Orange blob detection (simpler — centroid only, no shape check)
+ORANGE_BLOB_HUE_LOW   = 5     # OpenCV H (0-180)
+ORANGE_BLOB_HUE_HIGH  = 30
+ORANGE_BLOB_SAT_MIN   = 100
+ORANGE_BLOB_VAL_MIN   = 80
+ORANGE_BLOB_MIN_AREA_PX      = 80.0    # 30mm @ Z=-410 → ~230 px², well below
+ORANGE_BLOB_MAX_AREA_RATIO   = 0.05
+ORANGE_BLOB_MASK_OPEN_PX     = 2
+ORANGE_BLOB_MASK_CLOSE_PX    = 5
+ORANGE_BLOB_BORDER_REJECT_PX = 4
+ORANGE_SQ_MIN_AREA_PX         = 100.0   # 30mm @ Z=-410 → ~230 px², set well below
+ORANGE_SQ_MAX_AREA_RATIO      = 0.05
+ORANGE_SQ_MIN_WIDTH_PX        = 8       # 30mm → ~15 px wide
+ORANGE_SQ_MIN_HEIGHT_PX       = 8
+ORANGE_SQ_BORDER_REJECT_PX    = 5       # reduced — small object near edge should not be rejected too aggressively
+ORANGE_SQ_MASK_OPEN_PX        = 3
+ORANGE_SQ_MASK_CLOSE_PX       = 7
+ORANGE_SQ_POLY_EPSILON_SCALE  = 0.05
+ORANGE_SQ_MIN_RECTANGULARITY  = 0.76
+ORANGE_SQ_MIN_ASPECT_RATIO    = 0.75  # square: allow slight perspective
+ORANGE_SQ_MAX_ASPECT_RATIO    = 1.33
+
 WHITE_RECT_MIN_AREA_PX = 600.0
 WHITE_RECT_MAX_AREA_RATIO = 0.12
 WHITE_RECT_MIN_WIDTH_PX = 24
 WHITE_RECT_MIN_HEIGHT_PX = 24
-WHITE_RECT_MIN_BRIGHTNESS = 165
-WHITE_RECT_MAX_SATURATION = 100
-WHITE_RECT_MIN_CONTRAST = 18.0
+WHITE_RECT_MIN_BRIGHTNESS = 180
+WHITE_RECT_MAX_SATURATION = 80
+WHITE_RECT_MIN_CONTRAST = 28.0
 WHITE_RECT_MASK_OPEN_PX = 3
 WHITE_RECT_MASK_CLOSE_PX = 7
 WHITE_RECT_BORDER_REJECT_PX = 10
@@ -95,6 +140,9 @@ BOX_MAX_ASPECT_RATIO = 3.0
 AVG_FRAME_COUNT = 7
 CENTER_WINDOW = 5
 TRACK_GRID_PX = 80
+# Larger grid for conveyor mode: object moves ~2-4 px/frame so 160 px gives
+# ~40-80 stable frames per cell before the track ID resets at a boundary.
+CONVEYOR_TRACK_GRID_PX = 160
 DETECTION_CONFIRM_FRAMES = 2
 DETECTION_LOST_RESET_FRAMES = 5
 
@@ -114,6 +162,28 @@ DEPTH_MAD_SCALE = 2.0
 DEPTH_HISTORY_SIZE = 7
 DEPTH_MAX_JUMP_M = 0.015
 
+# ── Place position (shared drop point for all picks) ─────────────────────────
+# Calibrate by jogging the robot to the desired drop location and reading FK.
+PLACE_X =   0.0    # mm, robot base frame — placeholder, calibrate before use
+PLACE_Y = 100.0
+PLACE_Z = -410.0
+
+# Approximate EEF speed used for belt Y-prediction during moving pick.
+# Increase if robot overshoots, decrease if it arrives early.
+ROBOT_SPEED_MM_S = 200.0
+
+# Static EE correction offsets (mm).  Measure the real error at your target
+# position and set each offset to negate it: if the EE lands 10 mm too far in
+# +X, set EE_OFFSET_X_MM = -10.0.
+EE_OFFSET_X_MM = 0.0
+EE_OFFSET_Y_MM = 5.0
+EE_OFFSET_Z_MM = 0.0
+
+# Grid error map (replaces static EE_OFFSET when enabled).
+# Build the map with measure_error_grid.py, then flip this to True.
+ERROR_MAP_ENABLE = False
+ERROR_MAP_FILE   = "/home/s4mb4th/delta_ws/error_map.json"
+
 FK_VERIFY_TOL_MM = 3.0
 PRINT_COOLDOWN_SEC = 1.0
 FAKE_MOVE_COOLDOWN_SEC = 1.0
@@ -122,35 +192,75 @@ ENABLE_MOTORS = True
 MOVE_COOLDOWN_SEC = 1.5
 MOVE_THRESHOLD_MM = 4.0
 
-FAKE_DEPTH_ENABLE = False
-FAKE_DEPTH_M = 0.30
+FAKE_DEPTH_ENABLE = True
+FAKE_DEPTH_M = 0.762   # z_cam = CAM_TZ_MM(352) + |pick_z|(410) = 762 mm
 
-VISION_ONLY_ENABLE = True
+VISION_ONLY_ENABLE = False
 SIMPLE_RESULT_PRINT = True
-PURE_CAMERA_TEST_ENABLE = True
+PURE_CAMERA_TEST_ENABLE = False
+
+# Conveyor belt mode: skip stability check (object is always moving).
+# Camera publishes a target once track is confirmed + averaged over AVG_FRAME_COUNT frames.
+CONVEYOR_MODE = True
+
+# ── Conveyor belt hardware parameters ────────────────────────────────────────
+# Stepper motor: MIN_DELAY=70µs, STEPS_PER_REV=1600, GEAR_RATIO=36, PULLEY_DIA=49mm
+#   Motor RPM  = 60_000_000 / (2 × 70 × 1600) = 267.86 RPM
+#   Output RPM = 267.86 / 36                   = 7.44  RPM
+#   Belt mm/s  = (7.44 × π × 49) / 60         = 19.09 mm/s  ← design maximum
+CONVEYOR_BELT_SPEED_MM_S = 19.09   # mm/s at MAX_DELAY=70µs (full speed)
+
+# Velocity sanity bounds: camera estimate is rejected if it falls outside this range.
+# Lower bound covers belt not yet at speed; upper bound catches outlier regression.
+CONVEYOR_VY_MIN_MM_S =  1.0    # below this → belt probably stopped, use 0
+CONVEYOR_VY_MAX_MM_S = 25.0    # above this → regression outlier, clamp to design speed
+
+# Minimum seconds between consecutive target publishes to avoid flooding the robot.
+TARGET_PUBLISH_COOLDOWN_SEC = 3.0
+
+# Camera-frame workspace zone overlay.
+# Projects the robot reachable square (±X_LIMIT, ±Y_LIMIT) at WORKSPACE_PICK_Z_MM
+# and draws three coloured zones: approach (amber), workspace (green), exit (red).
+DRAW_WORKSPACE_ZONES = True
+WORKSPACE_PICK_Z_MM  = -410.0   # belt surface Z in robot base frame (mm)
 
 CAMERA_TRANSFORM_MODE = "A"
 CAMERA_USE_DIRECT_MATRIX = True
-CAMERA_DIRECT_MATRIX = (
-    (1.0, 0.0, 0.0),
-    (0.0, -1.0, 0.0),
-    (0.0, 0.0, -1.0),
-)
-CAM_FINE_ROLL_DEG = 0.0
-CAM_FINE_PITCH_DEG = 0.0
-CAM_FINE_YAW_DEG = 0.0
-CAM_TX_MM = 97.59
-CAM_TY_MM = 11.93
-CAM_TZ_MM = 432.00
 
-X_LIMIT = 151.563
-Y_LIMIT = 151.563
+# Rotation: x_base = -x_cam,  y_base = y_cam,  z_base = -z_cam
+# Measured mount: Y = 300 mm in front of base, Z = 80 mm above base origin
+# Working distance to home (z=-350): 80 + 350 = 430 mm
+CAMERA_DIRECT_MATRIX = (
+    (-1.0,  0.0,  0.0),
+    ( 0.0,  1.0,  0.0),
+    ( 0.0,  0.0, -1.0),
+)
+CAM_FINE_ROLL_DEG  = 0.0
+CAM_FINE_PITCH_DEG = 0.0
+CAM_FINE_YAW_DEG   = 0.0
+CAM_TX_MM =   0.0
+CAM_TY_MM =   0.0   # TODO: calibrate — place object at robot Y=0 and read y_cam
+CAM_TZ_MM = 352.0   # measured: z_cam ≈ 732 mm to surface at pick_z ≈ -380 mm
+
+# Full 4×4 homogeneous T_cam_to_base  (p_base = T @ [p_cam; 1])
+# Built from the R and t above — use camera_system._build_T_cam_to_base() at runtime
+CAMERA_T_BASE = (
+    (-1.0,  0.0,  0.0,   0.0),
+    ( 0.0,  1.0,  0.0,   0.0),
+    ( 0.0,  0.0, -1.0, 352.0),
+    ( 0.0,  0.0,  0.0,   1.0),
+)
+
+X_LIMIT = 150.0   # rectangular pre-filter; IK in check_workspace rejects unreachable corners
+Y_LIMIT = 150.0
 Z_MIN = -500.0
-Z_MAX = -196.875
+# Actual IK ceiling at centre: -sqrt(re^2 - (rf + (f-e)*tan30/2)^2) ≈ -323.5 mm.
+# The old value (-196.875) was geometrically wrong; any Z above -323 fails IK.
+Z_MAX = -323.0
 
 THETA1_MIN = 0.0
-THETA1_MAX = 82.11
+THETA1_MAX = 67   # physical hard stop observed at ~56° — use 54° with 2° margin
 THETA2_MIN = 0.0
-THETA2_MAX = 85.49
+THETA2_MAX = 67.0
 THETA3_MIN = 0.0
-THETA3_MAX = 85.49
+THETA3_MAX = 67.0

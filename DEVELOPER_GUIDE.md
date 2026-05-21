@@ -218,7 +218,40 @@ Z is clamped to `[Z_MIN, Z_MAX]` from config.
 
 ### Vision-guided mode — `delta_main_app/main_app.py`
 
-Adds a `CONFIRMING` state before `APPROACHING`. The camera must report a stable detection for `DETECTION_CONFIRM_FRAMES` consecutive frames within `STABLE_THRESH_X/Y/Z_MM` tolerance before the robot moves.
+Camera confirmation is handled **inside the camera node** (conveyor mode: `CONVEYOR_OK` after `AVG_FRAME_COUNT` frames; static mode: stability check + IK validation). Once confirmed, the camera publishes to `/delta/all_targets` (PoseArray).
+
+**Target flow into the FSM:**
+
+```
+/delta/all_targets  →  _all_targets_callback  (sorts candidates by distance from base origin, queues all)
+                    →  _queue_timer (10 Hz)   (pops queue, applies Y-prediction: y_pred = y + vy × t_travel)
+                    →  fsm.force_target(x, y_pred, z)  (starts sequence immediately — no CONFIRMING state)
+```
+
+The `CONFIRMING` state exists in `PickAndPlaceStateMachine` but is **not used** by `main_app.py`. `force_target()` bypasses it and starts the pick sequence directly.
+
+**FSM states (vision-guided):**
+
+```
+IDLE
+ │  force_target() called by _queue_timer
+ ▼
+APPROACHING   move(x, y, z+25)     ← 25 mm above object; skipped if IK fails at that Z
+ ▼
+PICKING       move(x, y, z)        ← descend to object surface
+ ▼
+GRASPING      gripper CLOSE        ← wait 0.4 s
+ ▼
+LIFTING       move(x, y, z+30)     ← lift with object
+ ▼
+TRANSPORTING  move(PLACE_X, PLACE_Y, PLACE_Z)
+ ▼
+DROPPING      gripper OPEN         ← wait 0.4 s
+ ▼
+RESETTING     move(0, 0, -350)     ← home, raw=True (EE_OFFSET skipped)
+ ▼
+IDLE
+```
 
 ---
 
@@ -230,35 +263,50 @@ Subscribes to RealSense topics and runs object detection. Publishes the detected
 
 **Detection modes** (set `DETECTION_MODE` in `config.py`):
 
-| Mode | Algorithm | Best for |
-|---|---|---|
-| `"white_rectangle"` | HSV threshold + contour | Light-coloured rectangular boxes |
-| `"yolo"` | YOLO11 model | Arbitrary objects with trained model |
+| Mode | Algorithm | CLAHE | Best for |
+|---|---|---|---|
+| `"orange_blob"` | HSV inRange → moments centroid | No | **Active mode** — orange objects on conveyor |
+| `"orange_square"` | HSV inRange → corner extraction | No | Orange rectangular objects |
+| `"blue_rectangle"` | HSV inRange → corner extraction | No | Blue rectangular objects |
+| `"white_rectangle"` | CLAHE → Otsu → corner extraction | Yes | Light-coloured rectangular boxes |
+| `"depth_foreground"` | Depth height map → contour | No | Any object raised above belt surface |
+| `"bbox_only"` | CLAHE → Otsu/Canny → contour | Yes | Generic box-shaped objects |
+| `"yolo"` | YOLO11 model | No | Arbitrary objects with trained model |
 
-**2D → 3D pipeline:**
+> CLAHE contrast enhancement is only applied in `white_rectangle` and `bbox_only` modes. `orange_blob` goes straight BGR → HSV → `cv2.inRange`.
+
+**2D → 3D pipeline (per frame):**
 
 ```
 Pixel (u, v)
-    │ RealSense aligned depth
+    │ depth = FAKE_DEPTH_M (0.762 m) if FAKE_DEPTH_ENABLE else RealSense aligned depth
+    │         real depth: contour mask → 25–75 percentile trim → MAD filter → median
+    │                     + jump-rejection over DEPTH_HISTORY_SIZE=7 frame buffer
     ▼
-Camera frame XYZ (metres)
-    │ CAMERA_DIRECT_MATRIX rotation + CAM_TX/Y/Z_MM translation
+Camera frame XYZ (mm)  via pixel_to_camera_xyz_mm(u, v, z_m)
+    │ T_cam_to_base: CAMERA_DIRECT_MATRIX (3×3) + CAM_TX/TY/TZ_MM translation
     ▼
 Robot base frame XYZ (mm)
-    │ check_workspace()
+    │ averaged over AVG_FRAME_COUNT=7 frames (median)
+    │ check_workspace() → reject if outside ±X_LIMIT / ±Y_LIMIT / Z range
     ▼
-Published on /delta/target_xyz (PointStamped, mm)
+Conveyor velocity:  linear regression over _timed_xyz_buf → vy (mm/s)
+    published on /delta/object_velocity_mm_s (PointStamped)
+    ▼
+Published on /delta/all_targets (PoseArray) — all allowed detections
 ```
 
 **Camera transform matrix** (`config.py`):
 
 ```python
 CAMERA_DIRECT_MATRIX = (
-    (1.0,  0.0,  0.0),   # camera +X  → robot +X
-    (0.0, -1.0,  0.0),   # camera +Y  → robot −Y
-    (0.0,  0.0, -1.0),   # camera +Z  → robot −Z
+    (-1.0,  0.0,  0.0),   # camera +X  → robot −X
+    ( 0.0,  1.0,  0.0),   # camera +Y  → robot +Y
+    ( 0.0,  0.0, -1.0),   # camera +Z  → robot −Z
 )
-CAM_TX_MM, CAM_TY_MM, CAM_TZ_MM = 97.59, 11.93, 432.00
+CAM_TX_MM = 0.0    # not yet calibrated
+CAM_TY_MM = 0.0    # TODO: calibrate — Y-offset of camera from base origin
+CAM_TZ_MM = 352.0  # measured: camera height above belt surface at pick Z≈−380 mm
 ```
 
 If the detected positions are systematically offset, adjust `CAM_TX_MM / CAM_TY_MM / CAM_TZ_MM` or use `CAM_FINE_ROLL/PITCH/YAW_DEG` for fine rotation.
