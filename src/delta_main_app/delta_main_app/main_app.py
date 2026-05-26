@@ -266,9 +266,7 @@ class PickAndPlaceStateMachine:
                     t_start = time.time()
                     for i in range(config.EE_CORRECTION_MAX_ITERS):
                         self._move(x, y, az)
-                        err_x, err_y = self._wait_fresh_ee_error(
-                            timeout=config.EE_CORRECTION_WAIT_S
-                        )
+                        err_x, err_y = self._wait_fresh_ee_error(timeout=0.8)
                         if err_x is None:
                             self._log.warn("No fresh EE error — skip correction")
                             break
@@ -277,16 +275,13 @@ class PickAndPlaceStateMachine:
                             f"Correction iter {i}: "
                             f"err_x={err_x:+.1f}mm x_dist={x_dist:.1f}mm"
                         )
-                        if x_dist < config.EE_CORRECTION_MIN_MM:
-                            self._log.info("X close enough — stop")
-                            break
                         if x_dist < config.EE_CORRECTION_THRESH_MM:
                             self._log.info("X converged")
                             break
                         if time.time() - t_start > config.EE_CORRECTION_TIMEOUT_S:
                             self._log.warn("Timeout — proceeding")
                             break
-                        x_new = x - err_x * config.EE_CORRECTION_GAIN
+                        x_new = x - err_x
                         if abs(x_new) > config.X_LIMIT:
                             self._log.warn("X out of workspace — skip")
                             break
