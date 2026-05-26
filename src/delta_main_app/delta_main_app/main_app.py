@@ -439,10 +439,6 @@ class DeltaMainApp(Node):
 
     def _all_targets_callback(self, msg: PoseArray) -> None:
         with self._queue_lock:
-            if self._fsm.state != "IDLE":
-                return
-            if self._target_queue:
-                return
             candidates = [
                 (p.position.x * 1000.0, p.position.y * 1000.0, p.position.z * 1000.0)
                 for p in msg.poses
@@ -450,8 +446,12 @@ class DeltaMainApp(Node):
             if not candidates:
                 return
             candidates.sort(key=lambda p: math.sqrt(p[0] ** 2 + p[1] ** 2))
-            self._target_queue = candidates
+            # Always feed the predictor so the regression window stays populated,
+            # even while the robot is busy or a pick is already queued.
             self._predictor.update_velocity(candidates[0][1], time.time())
+            if self._fsm.state != "IDLE" or self._target_queue:
+                return
+            self._target_queue = candidates
             self.get_logger().info(f"Queued {len(candidates)} target(s)")
 
     def _velocity_callback(self, msg: PointStamped) -> None:
