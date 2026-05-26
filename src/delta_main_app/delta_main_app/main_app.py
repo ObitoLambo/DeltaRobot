@@ -33,8 +33,10 @@ from geometry_msgs.msg import PointStamped, PoseArray
 from std_msgs.msg import Float32, String
 
 from delta_common import config
-from delta_common.fk_ik import check_workspace
+from delta_common import error_map
+from delta_common.fk_ik import check_workspace, delta_calcInverse, e, f, re, rf
 from delta_motor_controller.motor_controller import DeltaMotorController
+from delta_main_app.belt_predictor import BeltPredictor
 
 # -- Pick-and-place geometry (mm, robot base frame) --------------------
 # All Z values must stay within [config.Z_MIN, config.Z_MAX]
@@ -104,6 +106,8 @@ class PickAndPlaceStateMachine:
         self._target_xyz = None
         self._busy = False
         self._lock = threading.Lock()
+        self._ee_error_x = None
+        self._ee_error_y = None
 
     def detection_update(self, x: float, y: float, z: float) -> None:
         with self._lock:
@@ -139,6 +143,24 @@ class PickAndPlaceStateMachine:
         """Start a pick sequence immediately, bypassing confirmation.
         Camera already confirmed the target — no need to buffer frames.
         Returns False if the robot is currently busy."""
+        az = _approach_z(z)
+        lz = _lift_z(z)
+        for cx, cy, cz, label in (
+            (x,   y,   az,    "approach"),
+            (x,   y,   z,     "pick"),
+            (x,   y,   lz,    "lift"),
+            (0.0, 0.0, -350.0, "home"),
+        ):
+            st, t1, t2, t3 = delta_calcInverse(cx, cy, cz, e, f, re, rf)
+            if st == 0:
+                self._log.info(
+                    f"IK pre-check {label}: ({cx:.1f},{cy:.1f},{cz:.1f})"
+                    f" → OK t=({t1:.1f},{t2:.1f},{t3:.1f})"
+                )
+            else:
+                self._log.info(
+                    f"IK pre-check {label}: ({cx:.1f},{cy:.1f},{cz:.1f}) → FAIL"
+                )
         with self._lock:
             if self._busy:
                 return False
@@ -173,6 +195,33 @@ class PickAndPlaceStateMachine:
             + (max(zs) - min(zs)) ** 2
         )
         return spread < STABLE_THRESH_MM
+
+    def update_ee_error(self, err_x: float, err_y: float) -> None:
+        with self._lock:
+            if self._state not in ("APPROACHING", "PICKING"):
+                return
+            self._ee_error_x = err_x
+            self._ee_error_y = err_y
+
+    def _get_ee_error(self):
+        """Return latest EE error (mm) or (None, None) if not available."""
+        with self._lock:
+            if self._ee_error_x is None:
+                return None, None
+            return self._ee_error_x, self._ee_error_y
+
+    def _wait_fresh_ee_error(self, timeout=1.0):
+        """Invalidate stored error then block until a fresh sample arrives."""
+        with self._lock:
+            self._ee_error_x = None
+            self._ee_error_y = None
+        t = time.time()
+        while time.time() - t < timeout:
+            time.sleep(0.05)
+            with self._lock:
+                if self._ee_error_x is not None:
+                    return self._ee_error_x, self._ee_error_y
+        return None, None
 
     def _start_sequence(self) -> None:
         self._busy = True
@@ -209,6 +258,42 @@ class PickAndPlaceStateMachine:
                 if not self._move(x, y, az):
                     raise RuntimeError("APPROACH failed")
                 time.sleep(MOVE_SETTLE_SEC)
+                if config.CONVEYOR_APPROACH_WAIT_SEC > 0:
+                    time.sleep(config.CONVEYOR_APPROACH_WAIT_SEC)
+
+                if config.EE_CORRECTION_ENABLE:
+                    self._ctrl.set_speed_mode(config.EE_CORRECTION_SPEED_MODE)
+                    t_start = time.time()
+                    for i in range(config.EE_CORRECTION_MAX_ITERS):
+                        self._move(x, y, az)
+                        err_x, err_y = self._wait_fresh_ee_error(
+                            timeout=config.EE_CORRECTION_WAIT_S
+                        )
+                        if err_x is None:
+                            self._log.warn("No fresh EE error — skip correction")
+                            break
+                        x_dist = abs(err_x)
+                        self._log.info(
+                            f"Correction iter {i}: "
+                            f"err_x={err_x:+.1f}mm x_dist={x_dist:.1f}mm"
+                        )
+                        if x_dist < config.EE_CORRECTION_MIN_MM:
+                            self._log.info("X close enough — stop")
+                            break
+                        if x_dist < config.EE_CORRECTION_THRESH_MM:
+                            self._log.info("X converged")
+                            break
+                        if time.time() - t_start > config.EE_CORRECTION_TIMEOUT_S:
+                            self._log.warn("Timeout — proceeding")
+                            break
+                        x_new = x - err_x * config.EE_CORRECTION_GAIN
+                        if abs(x_new) > config.X_LIMIT:
+                            self._log.warn("X out of workspace — skip")
+                            break
+                        x = x_new
+                    self._ctrl.set_speed_mode(config.EE_PICK_SPEED_MODE)
+                    self._move(x, y, az)
+                    time.sleep(0.1)
 
             self._set_state("PICKING")
             if not self._move(x, y, z):
@@ -218,6 +303,9 @@ class PickAndPlaceStateMachine:
             self._set_state("GRASPING")
             self._gripper(1.0)
             time.sleep(GRASP_WAIT_SEC)
+            with self._lock:
+                self._ee_error_x = None
+                self._ee_error_y = None
 
             self._set_state("LIFTING")
             if not self._move(x, y, lz):
@@ -311,6 +399,8 @@ class DeltaMainApp(Node):
         self._target_queue: list = []
         self._belt_vy_mm_s: float = 0.0
         self._queue_lock = threading.Lock()
+        self._predictor = BeltPredictor()
+        self._verify_deadline: float = 0.0
 
         self._sub_all_targets = self.create_subscription(
             PoseArray, "/delta/all_targets", self._all_targets_callback, 10
@@ -321,12 +411,30 @@ class DeltaMainApp(Node):
         self._sub_status = self.create_subscription(
             String, "/delta/detection_status", self._status_callback, 10
         )
+        self._ee_error_x = 0.0
+        self._ee_error_y = 0.0
+        self._ee_error_count = 0
+        self._sub_ee_error = self.create_subscription(
+            PointStamped, "/delta/ee_error_mm", self._ee_error_callback, 10
+        )
         self.create_timer(0.1, self._queue_timer)
 
         self.get_logger().info(
             f"DeltaMainApp ready  "
             f"Z_workspace=[{config.Z_MIN:.0f}, {config.Z_MAX:.0f}] mm  "
             f"place=({config.PLACE_X:.0f}, {config.PLACE_Y:.0f}, {config.PLACE_Z:.0f}) mm"
+        )
+
+    def _ee_error_callback(self, msg: PointStamped) -> None:
+        alpha = config.EE_CORRECTION_ALPHA
+        self._ee_error_x = alpha * msg.point.x + (1.0 - alpha) * self._ee_error_x
+        self._ee_error_y = alpha * msg.point.y + (1.0 - alpha) * self._ee_error_y
+        self._ee_error_count += 1
+        self._fsm.update_ee_error(msg.point.x, msg.point.y)
+        self.get_logger().info(
+            f"EE error: dx={self._ee_error_x:+.1f}mm "
+            f"dy={self._ee_error_y:+.1f}mm "
+            f"(n={self._ee_error_count})"
         )
 
     def _all_targets_callback(self, msg: PoseArray) -> None:
@@ -343,6 +451,7 @@ class DeltaMainApp(Node):
                 return
             candidates.sort(key=lambda p: math.sqrt(p[0] ** 2 + p[1] ** 2))
             self._target_queue = candidates
+            self._predictor.update_velocity(candidates[0][1], time.time())
             self.get_logger().info(f"Queued {len(candidates)} target(s)")
 
     def _velocity_callback(self, msg: PointStamped) -> None:
@@ -353,15 +462,35 @@ class DeltaMainApp(Node):
             if self._fsm.state != "IDLE" or not self._target_queue:
                 return
             x, y, z = self._target_queue.pop(0)
-            dist_mm = math.sqrt(x ** 2 + y ** 2)
-            t_travel = dist_mm / max(config.ROBOT_SPEED_MM_S, 1.0)
-            y_pred = y + self._belt_vy_mm_s * t_travel
-            if not check_workspace(x, y_pred, z):
+
+            result = self._predictor.predict(x, y)
+            if not result.valid:
                 self.get_logger().warn(
-                    f"Predicted pick ({x:.1f}, {y_pred:.1f}, {z:.1f}) outside workspace — skipped"
+                    f"Predicted pick ({x:.1f}, {result.y_pick:.1f}, {z:.1f}) outside workspace "
+                    f"or insufficient belt data — skipped"
                 )
                 return
-            self._fsm.force_target(x, y_pred, z)
+            if not check_workspace(x, result.y_pick, z):
+                self.get_logger().warn(
+                    f"Predicted pick ({x:.1f}, {result.y_pick:.1f}, {z:.1f}) outside workspace — skipped"
+                )
+                return
+            x_pick = x
+            y_pick = result.y_pick
+            if config.ERROR_MAP_ENABLE:
+                dx, dy, _ = error_map.correction(x_pick, y_pick, z, config.ERROR_MAP_FILE)
+                x_pick -= dx
+                y_pick -= dy
+                self.get_logger().info(
+                    f"Error map correction: dx={dx:.1f} dy={dy:.1f} mm"
+                )
+            self.get_logger().info(
+                f"Pre-position target: ({x_pick:.1f}, {y_pick:.1f}, {z:.1f}) mm  "
+                f"vy={result.vy_mm_s:.1f} mm/s  offset={result.belt_offset:.1f} mm  "
+                f"t={result.t_total:.2f} s"
+            )
+            self._check_belt_verify()
+            self._fsm.force_target(x_pick, y_pick, z)
 
     def _status_callback(self, msg: String) -> None:
         if "NO_DETECTION" in msg.data or "LOST" in msg.data:
@@ -377,22 +506,78 @@ class DeltaMainApp(Node):
         m.data = state
         self._state_pub.publish(m)
 
+    def verify_belt_speed(self) -> None:
+        """
+        Start a 10-second belt speed verification window.
+        Ensure objects are on the belt before calling.
+        After 10 s the measured velocity is compared to CONVEYOR_BELT_SPEED_MM_S
+        and a warning is printed if the difference exceeds 1.0 mm/s.
+        """
+        self._predictor.clear()
+        self._verify_deadline = time.time() + 10.0
+        self.get_logger().info(
+            "Belt speed verification started — keep belt running with objects. "
+            "Result in 10 s..."
+        )
+
+    def _check_belt_verify(self) -> None:
+        if self._verify_deadline == 0.0 or time.time() < self._verify_deadline:
+            return
+        self._verify_deadline = 0.0
+        vy = self._predictor.measured_vy
+        if vy is None:
+            self.get_logger().warn(
+                "Belt verify: not enough samples — no objects detected during window?"
+            )
+            return
+        measured = abs(vy)
+        expected = config.CONVEYOR_BELT_SPEED_MM_S
+        diff = abs(measured - expected)
+        status = "WARNING" if diff > 1.0 else "OK"
+        msg = (
+            f"\n===== BELT SPEED VERIFICATION =====\n"
+            f"  Measured : {measured:.2f} mm/s\n"
+            f"  Config   : {expected:.2f} mm/s\n"
+            f"  Diff     : {diff:.2f} mm/s  [{status}]\n"
+        )
+        if diff > 1.0:
+            msg += f"  → Update config.py: CONVEYOR_BELT_SPEED_MM_S = {measured:.2f}\n"
+        msg += "==================================="
+        if diff > 1.0:
+            self.get_logger().warn(msg)
+        else:
+            self.get_logger().info(msg)
+
     def destroy_node(self) -> None:
         self._send_gripper(0.0)
         if config.ENABLE_MOTORS:
+            try:
+                self._ctrl.move_xyz(HOME_X, HOME_Y, HOME_Z, raw=True)
+                time.sleep(0.5)
+            except Exception:
+                pass
             self._ctrl.shutdown()
         super().destroy_node()
 
 
 def main(args=None):
+    import signal
     rclpy.init(args=args)
     node = DeltaMainApp()
+
+    def handle_sigint(sig, frame):
+        node.get_logger().info("Ctrl+C received — shutting down cleanly")
+        node.destroy_node()
+        rclpy.shutdown()
+
+    signal.signal(signal.SIGINT, handle_sigint)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        if rclpy.ok():
+            node.destroy_node()
         rclpy.shutdown()
 
 

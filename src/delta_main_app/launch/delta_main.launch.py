@@ -1,7 +1,8 @@
 # CHANGES: [D455 default] disable accel/gyro IMU, set conservative 640x480x15 profiles
 # CHANGES: [D455 default] disable accel/gyro IMU, set conservative 640x480x15 profiles
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, RegisterEventHandler
+from launch.event_handlers import OnProcessExit
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -41,6 +42,11 @@ def generate_launch_description():
         output="screen",
     )
 
+    can_down = ExecuteProcess(
+        cmd=["sudo", "ip", "link", "set", "can0", "down"],
+        output="screen",
+    )
+
     return LaunchDescription([
         DeclareLaunchArgument("align_depth_enable", default_value="true"),
         DeclareLaunchArgument("color_profile", default_value="640x480x15"),
@@ -51,4 +57,10 @@ def generate_launch_description():
         realsense,
         camera_node,
         main_app,
+        RegisterEventHandler(
+            OnProcessExit(
+                target_action=main_app,
+                on_exit=[can_down],
+            )
+        ),
     ])

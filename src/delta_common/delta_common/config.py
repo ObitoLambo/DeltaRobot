@@ -162,22 +162,26 @@ DEPTH_MAD_SCALE = 2.0
 DEPTH_HISTORY_SIZE = 7
 DEPTH_MAX_JUMP_M = 0.015
 
-# ── Place position (shared drop point for all picks) ─────────────────────────
-# Calibrate by jogging the robot to the desired drop location and reading FK.
-PLACE_X =   0.0    # mm, robot base frame — placeholder, calibrate before use
-PLACE_Y = 100.0
-PLACE_Z = -410.0
+# Drop at belt exit edge — Y = -150mm
+PLACE_X =   0.0
+PLACE_Y = -150.0
+PLACE_Z = -410.0   # if IK returns st=-1, raise to -390.0 or -380.0
 
-# Approximate EEF speed used for belt Y-prediction during moving pick.
-# Increase if robot overshoots, decrease if it arrives early.
-ROBOT_SPEED_MM_S = 200.0
+# Acceleration used for triangular travel-time prediction (medium preset).
+# Within ±150mm workspace all moves are triangular: t = 2*sqrt(dist / TRAJ_A_MAX_MM_S2)
+TRAJ_A_MAX_MM_S2 = 5000.0
+
+# Extra wait at approach Z (mm above object) after robot pre-positions.
+# Gives the object time to arrive if Y prediction is still slightly off.
+# Increase in small steps (0.1 s) if robot still arrives before object.
+CONVEYOR_APPROACH_WAIT_SEC = 0.3
 
 # Static EE correction offsets (mm).  Measure the real error at your target
 # position and set each offset to negate it: if the EE lands 10 mm too far in
 # +X, set EE_OFFSET_X_MM = -10.0.
 EE_OFFSET_X_MM = 0.0
-EE_OFFSET_Y_MM = 5.0
-EE_OFFSET_Z_MM = 0.0
+EE_OFFSET_Y_MM = 0.0
+EE_OFFSET_Z_MM = 0.0    
 
 # Grid error map (replaces static EE_OFFSET when enabled).
 # Build the map with measure_error_grid.py, then flip this to True.
@@ -195,6 +199,14 @@ MOVE_THRESHOLD_MM = 4.0
 FAKE_DEPTH_ENABLE = True
 FAKE_DEPTH_M = 0.762   # z_cam = CAM_TZ_MM(352) + |pick_z|(410) = 762 mm
 
+# Fixed fake object position for testing EE correction
+# Set FAKE_OBJ_ENABLE = True to use fixed position
+# instead of real camera detection
+FAKE_OBJ_ENABLE = False
+FAKE_OBJ_X_MM   =  0.0   # robot base frame mm
+FAKE_OBJ_Y_MM   =  0.0   # center of workspace
+FAKE_OBJ_Z_MM   = -410.0 # belt surface
+
 VISION_ONLY_ENABLE = False
 SIMPLE_RESULT_PRINT = True
 PURE_CAMERA_TEST_ENABLE = False
@@ -208,7 +220,8 @@ CONVEYOR_MODE = True
 #   Motor RPM  = 60_000_000 / (2 × 70 × 1600) = 267.86 RPM
 #   Output RPM = 267.86 / 36                   = 7.44  RPM
 #   Belt mm/s  = (7.44 × π × 49) / 60         = 19.09 mm/s  ← design maximum
-CONVEYOR_BELT_SPEED_MM_S = 19.09   # mm/s at MAX_DELAY=70µs (full speed)
+#   Measured physical speed: 12.85 mm/s (stepper running below design maximum)
+CONVEYOR_BELT_SPEED_MM_S = 12.85   # mm/s — physically measured
 
 # Velocity sanity bounds: camera estimate is rejected if it falls outside this range.
 # Lower bound covers belt not yet at speed; upper bound catches outlier regression.
@@ -224,6 +237,32 @@ TARGET_PUBLISH_COOLDOWN_SEC = 3.0
 DRAW_WORKSPACE_ZONES = True
 WORKSPACE_PICK_Z_MM  = -410.0   # belt surface Z in robot base frame (mm)
 
+# EE marker detection (white laser dot on end-effector tip)
+EE_CORRECTION_ENABLE    = True
+EE_CORRECTION_MAX_MM    = 50.0   # ignore correction if error exceeds this
+EE_CORRECTION_ALPHA     = 0.3    # exponential smoothing factor (node-side running average)
+EE_CORRECTION_GAIN      = 0.6    # proportional gain — apply this fraction of error per step
+EE_CORRECTION_THRESH_MM = 5.0    # stop loop when EE is within this distance (mm)
+EE_CORRECTION_MIN_MM    = 3.0    # ignore errors smaller than this (no micro-adjustments)
+EE_CORRECTION_MAX_ITERS = 3      # maximum correction iterations per pick
+EE_CORRECTION_TIMEOUT_S = 2.0    # give up and pick anyway after this many seconds
+EE_CORRECTION_WAIT_S    = 0.5    # wait for fresh EE error after each correction move
+EE_CORRECTION_SPEED_MODE = 'low'    # speed preset during correction loop
+EE_PICK_SPEED_MODE       = 'medium' # speed preset during pick descent
+
+EE_LASER_SAT_MAX       = 50    # white = any hue, low saturation
+EE_LASER_VAL_MIN       = 210   # white = very bright
+EE_LASER_MIN_AREA      = 3
+EE_LASER_MAX_AREA      = 300
+EE_LASER_MAX_JUMP_PX   = 50    # reject detection if it jumps > this many px
+EE_LASER_SMOOTH_FRAMES = 3     # median over this many recent valid positions
+DRAW_EE_MARKER         = True
+# Shift the overlay box in the camera stream without affecting 3D detection.
+# Positive X_OFFSET_MM moves box right in robot base frame (→ left in image).
+# Positive Y_OFFSET_MM moves box toward the approach side (belt entry direction).
+WORKSPACE_OVERLAY_X_OFFSET_MM = 0.0
+WORKSPACE_OVERLAY_Y_OFFSET_MM = 0.0
+
 CAMERA_TRANSFORM_MODE = "A"
 CAMERA_USE_DIRECT_MATRIX = True
 
@@ -238,17 +277,17 @@ CAMERA_DIRECT_MATRIX = (
 CAM_FINE_ROLL_DEG  = 0.0
 CAM_FINE_PITCH_DEG = 0.0
 CAM_FINE_YAW_DEG   = 0.0
-CAM_TX_MM =   0.0
-CAM_TY_MM =   0.0   # TODO: calibrate — place object at robot Y=0 and read y_cam
-CAM_TZ_MM = 352.0   # measured: z_cam ≈ 732 mm to surface at pick_z ≈ -380 mm
+CAM_TX_MM =  -5.0   # tuning — adjust in ±10mm steps until green box centres under arm
+CAM_TY_MM = +305.0   # calibrated: +57mm correction for 45px vertical gap at Z_cam≈762mm, fy≈600
+CAM_TZ_MM =  352.0   # measured: z_cam ≈ 732 mm to surface at pick_z ≈ -380 mm
 
 # Full 4×4 homogeneous T_cam_to_base  (p_base = T @ [p_cam; 1])
 # Built from the R and t above — use camera_system._build_T_cam_to_base() at runtime
 CAMERA_T_BASE = (
-    (-1.0,  0.0,  0.0,   0.0),
-    ( 0.0,  1.0,  0.0,   0.0),
-    ( 0.0,  0.0, -1.0, 352.0),
-    ( 0.0,  0.0,  0.0,   1.0),
+    (-1.0,  0.0,  0.0,  CAM_TX_MM),
+    ( 0.0,  1.0,  0.0, CAM_TY_MM),
+    ( 0.0,  0.0, -1.0,  CAM_TZ_MM),
+    ( 0.0,  0.0,  0.0,    1.0),
 )
 
 X_LIMIT = 150.0   # rectangular pre-filter; IK in check_workspace rejects unreachable corners

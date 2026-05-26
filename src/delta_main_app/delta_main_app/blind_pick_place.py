@@ -117,7 +117,7 @@ class BlindPickAndPlace(Node):
         self.declare_parameter('traj_a_max_mm_s2',  200.0)
         self.declare_parameter('traj_dt_s',           0.05)
         self.declare_parameter('pneumatic_can_id',        4)
-        self.declare_parameter('speed_mode',            'low')
+        self.declare_parameter('speed_mode',            'medium')
         self.declare_parameter('gripper_length_mm',     120.0)
         self.declare_parameter('approach_z_offset_mm', 80.0)
         self.declare_parameter('random_pick_points',    [0.0, 50.0, -350.0])
@@ -555,6 +555,12 @@ class BlindPickAndPlace(Node):
 
     def destroy_node(self) -> None:
         if config.ENABLE_MOTORS:
+            try:
+                self._gripper.open(wait=False)
+                self._ctrl.move_xyz(HOME_X, HOME_Y, HOME_Z, raw=True)
+                time.sleep(0.5)
+            except Exception:
+                pass
             self._gripper.disconnect()
             self._ctrl.shutdown()
         super().destroy_node()
@@ -562,14 +568,23 @@ class BlindPickAndPlace(Node):
 
 # ═════════════════════════════════════════════════════════════════════════════
 def main(args=None):
+    import signal
     rclpy.init(args=args)
     node = BlindPickAndPlace()
+
+    def handle_sigint(sig, frame):
+        node.get_logger().info("Ctrl+C received — shutting down cleanly")
+        node.destroy_node()
+        rclpy.shutdown()
+
+    signal.signal(signal.SIGINT, handle_sigint)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        if rclpy.ok():
+            node.destroy_node()
         rclpy.shutdown()
 
 

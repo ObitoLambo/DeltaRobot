@@ -16,6 +16,7 @@ from geometry_msgs.msg import Pose, PoseArray, PointStamped
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 from ultralytics import YOLO
 
 from delta_common import config
@@ -63,10 +64,9 @@ class DeltaCamera(Node):
         self.camera_translation = self.T_cam_to_base[:3,  3]
         self.plane_homography = self.build_plane_homography()
 
-        self.xyz_buffer = deque(maxlen=config.AVG_FRAME_COUNT)
-        self._timed_xyz_buf = deque(maxlen=config.AVG_FRAME_COUNT)
+        self._xyz_buffers: dict = {}        # per-track xyz history
+        self._timed_xyz_bufs: dict = {}     # per-track timestamped xyz history
         self.depth_buffer = deque(maxlen=config.DEPTH_HISTORY_SIZE)
-        self.last_track_id = None
         self.last_depth_track_id = None
         self.last_stable_xyz = None
 
@@ -83,6 +83,9 @@ class DeltaCamera(Node):
         self._pub_velocity    = self.create_publisher(PointStamped, "/delta/object_velocity_mm_s", 10)
         self._pub_status      = self.create_publisher(String,       "/delta/detection_status",     10)
         self._pub_all_targets = self.create_publisher(PoseArray,    "/delta/all_targets",          10)
+        self._pub_ee_pos      = self.create_publisher(PointStamped, "/delta/ee_position_mm",       10)
+        self._pub_ee_error    = self.create_publisher(PointStamped, "/delta/ee_error_mm",          10)
+        self.create_service(Trigger, "/delta/calibrate_cam_offset", self._calibrate_offset_srv)
 
         mode = "FAKE DEPTH" if config.FAKE_DEPTH_ENABLE else "REAL DEPTH"
         self.get_logger().info(
@@ -91,6 +94,9 @@ class DeltaCamera(Node):
 
         if self.VIEW_IMAGE:
             cv2.namedWindow("Delta Camera", cv2.WINDOW_NORMAL)
+
+        self._cal_active = False
+        self._cal_samples: list = []
 
         self.reset_tracking_state()
         self._validate_config()
@@ -135,6 +141,7 @@ class DeltaCamera(Node):
         if best is not None:
             self.maybe_print_result(best)
             self.fake_motor_command(best)
+            self._collect_cal_sample(best)
 
         if self.VIEW_IMAGE:
             self._draw_perf_overlay(annotated)
@@ -161,6 +168,39 @@ class DeltaCamera(Node):
         self.draw_workspace_overlay(annotated, frame_w, frame_h)
         if config.DRAW_CAMERA_AXIS_LEGEND:
             self.draw_camera_axis_legend(annotated)
+
+        # ── EE marker detection ───────────────────────────────────────────────
+        ee_pixel = None
+        ee_base_xy = None
+        ee_uv = self.detect_ee_marker(frame)
+        if ee_uv is not None:
+            eu, ev = ee_uv
+            ee_z_m = None
+            if depth_image is not None:
+                r = 8  # sample within 8px of EE centroid
+                vals = self.collect_depth_values_meters(
+                    depth_image, eu, ev, eu - r, ev - r, eu + r, ev + r)
+                z_robust = self.robust_depth_from_values(vals)
+                if z_robust is not None:
+                    ee_z_m = z_robust
+            if ee_z_m is None:
+                ee_z_m = config.FAKE_DEPTH_M
+            ee_cam = self.pixel_to_camera_xyz_mm(eu, ev, ee_z_m)
+            if ee_cam is not None:
+                ex_b, ey_b, ez_b = self.camera_to_base_mm(*ee_cam)
+                ee_pixel = (eu, ev)
+                ee_base_xy = (ex_b, ey_b)
+                pt = PointStamped()
+                pt.header.stamp = self.get_clock().now().to_msg()
+                pt.header.frame_id = "robot_base"
+                pt.point.x = ex_b
+                pt.point.y = ey_b
+                pt.point.z = ez_b
+                self._pub_ee_pos.publish(pt)
+            if getattr(config, "DRAW_EE_MARKER", True):
+                cv2.circle(annotated, (eu, ev), 6, (255, 255, 0), 2)
+                cv2.putText(annotated, "EE", (eu + 8, ev),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255, 255, 0), 1)
 
         detections = self.generate_detections(frame, depth_image)
         if not detections:
@@ -251,19 +291,24 @@ class DeltaCamera(Node):
                 track_id,
                 contour=depth_contour if depth_contour is not None else center_contour,
             )
+            depth_is_approx = False
             if z_m is None:
-                label = f"{name} {conf:.2f} C=({u},{v}) NO_DEPTH"
-                cv2.putText(
-                    annotated,
-                    label,
-                    (x1, max(20, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                continue
+                if config.FAKE_DEPTH_ENABLE:
+                    z_m = config.FAKE_DEPTH_M
+                    depth_is_approx = True
+                else:
+                    label = f"{name} {conf:.2f} C=({u},{v}) NO_DEPTH"
+                    cv2.putText(
+                        annotated,
+                        label,
+                        (x1, max(20, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 0, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    continue
 
             xyz_cam = self.pixel_to_camera_xyz_mm(u, v, z_m)
             if xyz_cam is None:
@@ -289,7 +334,18 @@ class DeltaCamera(Node):
             xyz_avg = self.update_xyz_average(track_id, (x_base_now, y_base_now, z_base_now))
 
             workspace_xyz = xyz_avg if xyz_avg is not None else (x_base_now, y_base_now, z_base_now)
-            if config.DETECT_ONLY_IN_WORKSPACE and not self.check_workspace(*workspace_xyz):
+            wx, wy, wz = workspace_xyz
+            in_workspace = self.check_workspace(wx, wy, wz)
+            # In conveyor mode, also allow objects in the approach zone (y > Y_LIMIT)
+            # so the robot can pre-position while the object is still incoming.
+            in_approach_zone = (
+                config.CONVEYOR_MODE
+                and abs(wx) <= config.X_LIMIT
+                and wy > config.Y_LIMIT
+                and config.Z_MIN <= wz <= config.Z_MAX
+                and len(self._timed_xyz_bufs.get(track_id, [])) >= 3
+            )
+            if config.DETECT_ONLY_IN_WORKSPACE and not in_workspace and not in_approach_zone:
                 if config.DRAW_REJECTED_DETECTIONS:
                     self.draw_rejected_detection(
                         annotated,
@@ -316,9 +372,10 @@ class DeltaCamera(Node):
                 if xyz_avg is not None:
                     x_use, y_use, z_use = xyz_avg
                     if config.CONVEYOR_MODE:
-                        # Object is moving — skip stability check, use averaged position
+                        # Object is moving — skip stability check, use averaged position.
+                        # Also allow early trigger from approach zone.
                         allowed = True
-                        reason = "CONVEYOR_OK"
+                        reason = "CONVEYOR_OK" if in_workspace else "APPROACH_ZONE"
                     elif not self.is_stable(xyz_avg):
                         reason = "NOT_STABLE"
                     elif config.VISION_ONLY_ENABLE:
@@ -336,7 +393,12 @@ class DeltaCamera(Node):
             pose_yaw = None if pose_info is None else pose_info["pose_yaw_deg"]
             display_yaw = pose_yaw if pose_yaw is not None else plane_yaw_deg
 
-            label_color = (0, 255, 0) if allowed else (0, 0, 255)
+            if depth_is_approx:
+                label_color = (0, 255, 255)   # yellow — approximate depth
+            elif allowed:
+                label_color = (0, 255, 0)
+            else:
+                label_color = (0, 0, 255)
             if pure_camera_mode:
                 label = f"{name} {conf:.2f} CAM=({x_cam:.1f},{y_cam:.1f},{z_cam:.1f}) {reason}"
             elif config.VISION_ONLY_ENABLE:
@@ -347,6 +409,8 @@ class DeltaCamera(Node):
                 if display_yaw is not None:
                     label += f"YAW={display_yaw:.1f} "
                 label += reason
+                if depth_is_approx:
+                    label += " APPROX"
             else:
                 label = (
                     f"{name} {conf:.2f} "
@@ -354,6 +418,8 @@ class DeltaCamera(Node):
                     f"BASE=({x_use:.1f},{y_use:.1f},{z_use:.1f}) "
                     f"{theta_text}{reason}"
                 )
+                if depth_is_approx:
+                    label += " APPROX"
             label_y = max(20, y1 - 8)
             cv2.putText(
                 annotated,
@@ -417,6 +483,7 @@ class DeltaCamera(Node):
                 "fk_err": fk_err,
                 "allowed": allowed,
                 "reason": reason,
+                "track_id": track_id,
             }
 
             all_candidates.append(candidate)
@@ -445,10 +512,11 @@ class DeltaCamera(Node):
                     pt.header.frame_id = "robot_base"
                     pt.point.x = best["x_base"] / 1000.0
                     pt.point.z = best["z_base"] / 1000.0
-                    if config.CONVEYOR_MODE and len(self._timed_xyz_buf) > 0:
+                    best_timed_buf = self._timed_xyz_bufs.get(best["track_id"], deque())
+                    if config.CONVEYOR_MODE and len(best_timed_buf) > 0:
                         # Use the most recent raw Y to avoid the ~(AVG_FRAME_COUNT/2)-frame
                         # median lag. The robot's prediction adds vy*t_travel on top of this.
-                        pt.point.y = self._timed_xyz_buf[-1][2] / 1000.0
+                        pt.point.y = best_timed_buf[-1][2] / 1000.0
                     else:
                         pt.point.y = best["y_base"] / 1000.0
                     self._pub_target.publish(pt)
@@ -456,7 +524,7 @@ class DeltaCamera(Node):
                     vel = PointStamped()
                     vel.header.stamp = stamp
                     vel.header.frame_id = "robot_base"
-                    vel.point.y = self._estimate_vy()   # mm/s along -Y conveyor axis
+                    vel.point.y = self._estimate_vy(best_timed_buf)
                     self._pub_velocity.publish(vel)
 
         allowed_targets = [c for c in all_candidates if c["allowed"]]
@@ -471,6 +539,35 @@ class DeltaCamera(Node):
                 p.position.z = c["z_base"] / 1000.0
                 pa.poses.append(p)
             self._pub_all_targets.publish(pa)
+
+        # ── EE vs object error display ────────────────────────────────────────
+        if (ee_pixel is not None and best is not None
+                and self.fx is not None and self.fy is not None):
+            ex, ey = ee_pixel
+            ox, oy = best["u"], best["v"]
+            du = ox - ex
+            dv = oy - ey
+            z_cam_mm = config.FAKE_DEPTH_M * 1000.0
+            dx_mm = du * z_cam_mm / self.fx
+            dy_mm = dv * z_cam_mm / self.fy
+            cv2.line(annotated, (ex, ey), (ox, oy), (0, 255, 255), 1)
+            mx, my = (ex + ox) // 2, (ey + oy) // 2
+            cv2.putText(annotated, f"err {dx_mm:+.0f},{dy_mm:+.0f}mm",
+                        (mx + 4, my), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.25, (0, 255, 255), 1)
+            err_pt = PointStamped()
+            err_pt.header.stamp = self.get_clock().now().to_msg()
+            err_pt.header.frame_id = "robot_base"
+            err_pt.point.x = dx_mm
+            err_pt.point.y = dy_mm
+            err_pt.point.z = 0.0
+            self._pub_ee_error.publish(err_pt)
+            self._ee_err_frame = getattr(self, "_ee_err_frame", 0) + 1
+            if self._ee_err_frame % 10 == 0:
+                self.get_logger().info(
+                    f"EE vs obj: dx={dx_mm:+.1f} dy={dy_mm:+.1f} mm  "
+                    f"(du={du} dv={dv} px)"
+                )
 
         return annotated, best
 
@@ -529,6 +626,8 @@ class DeltaCamera(Node):
 
         L = config.X_LIMIT          # 151.563 mm — half-width of workspace square
         z = config.WORKSPACE_PICK_Z_MM  # belt surface in base frame
+        ox = getattr(config, "WORKSPACE_OVERLAY_X_OFFSET_MM", 0.0)
+        oy = getattr(config, "WORKSPACE_OVERLAY_Y_OFFSET_MM", 0.0)
 
         # Project 4 corners of the reachable square at pick Z.
         # Split into entry edge (y=+L, where belt objects arrive) and
@@ -536,7 +635,7 @@ class DeltaCamera(Node):
         entry_px, exit_px = [], []
         for sx in (-1.0, 1.0):
             for sy, bucket in ((+1.0, entry_px), (-1.0, exit_px)):
-                pt = self._project_base_to_pixel(sx * L, sy * L, z)
+                pt = self._project_base_to_pixel(sx * L + ox, sy * L + oy, z)
                 if pt is None:
                     return   # camera not ready or point behind camera
                 bucket.append(pt)
@@ -562,6 +661,7 @@ class DeltaCamera(Node):
 
         # Robot workspace: the 4 projected corners
         ws_poly = np.array([list(el), list(er), list(xr), list(xl)], dtype=np.int32)
+        self._ws_poly = ws_poly   # cached for EE bounds filter
         cv2.fillPoly(overlay, [ws_poly], (0, 200, 60))           # green
 
         # Exit: top of image → exit edge
@@ -576,32 +676,17 @@ class DeltaCamera(Node):
         cv2.line(annotated, tuple(el), tuple(er), (0, 160, 255), 2)  # entry
         cv2.line(annotated, tuple(xl), tuple(xr), (60, 60, 200), 2)  # exit
 
-        # ── zone labels ───────────────────────────────────────────────────────
-        def put_label(text, tx, ty, color):
-            tx = max(4, min(frame_w - 120, tx - 55))
-            ty = max(16, min(frame_h - 6, ty))
-            cv2.putText(annotated, text, (tx, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(annotated, text, (tx, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color,     2, cv2.LINE_AA)
+        # ── workspace center crosshair (X=0, Y=0) ────────────────────────────
+        ctr = self._project_base_to_pixel(
+            getattr(config, 'WORKSPACE_OVERLAY_X_OFFSET_MM', 0.0),
+            getattr(config, 'WORKSPACE_OVERLAY_Y_OFFSET_MM', 0.0),
+            z,
+        )
+        if ctr is not None:
+            cx, cy = int(ctr[0]), int(ctr[1])
+            cv2.line(annotated, (cx - 4, cy), (cx + 4, cy), (255, 255, 255), 1)
+            cv2.line(annotated, (cx, cy - 4), (cx, cy + 4), (255, 255, 255), 1)
 
-        put_label("APPROACH",
-                  frame_w // 2, (frame_h + el[1]) // 2, (0, 160, 255))
-        put_label("ROBOT WORKSPACE",
-                  (el[0] + xr[0]) // 2, (el[1] + xr[1]) // 2, (0, 255, 60))
-        put_label("EXIT",
-                  frame_w // 2, xl[1] // 2, (60, 60, 200))
-
-        # ── conveyor direction arrow ──────────────────────────────────────────
-        # Belt moves objects from approach (high v) toward exit (low v) = upward in image
-        ax = frame_w - 36
-        av_start = min(frame_h - 10, el[1] + 20)
-        av_end   = max(10,           xl[1] - 20)
-        if av_start > av_end:
-            cv2.arrowedLine(annotated, (ax, av_start), (ax, av_end),
-                            (220, 220, 220), 2, tipLength=0.20)
-            cv2.putText(annotated, "-Y", (ax - 16, (av_start + av_end) // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
 
     def draw_base_axis_overlay(self, annotated, x1: int, y1: int, x2: int, y2: int):
         roi_w = max(1, x2 - x1)
@@ -879,10 +964,9 @@ class DeltaCamera(Node):
             self.reset_tracking_state()
 
     def reset_tracking_state(self):
-        self.xyz_buffer.clear()
-        self._timed_xyz_buf.clear()
+        self._xyz_buffers.clear()
+        self._timed_xyz_bufs.clear()
         self.depth_buffer.clear()
-        self.last_track_id = None
         self.last_depth_track_id = None
         self.last_stable_xyz = None
         self._confirm_counts = {}
@@ -1930,9 +2014,6 @@ class DeltaCamera(Node):
         track_id: str,
         contour=None,
     ) -> Optional[float]:
-        if config.FAKE_DEPTH_ENABLE:
-            return config.FAKE_DEPTH_M
-
         if depth_image is None:
             return None
 
@@ -2123,6 +2204,119 @@ class DeltaCamera(Node):
             "obj_size_mm": (obj_long_mm, obj_short_mm),
             "size_source": size_source,
         }
+
+    def detect_ee_marker(self, frame):
+        """Detect white laser dot on EE tip. Returns (u, v) centroid or None.
+
+        Must be called with the RAW frame.
+        White in HSV: any hue, S < sat_max, V > val_min.
+        Among size-passing blobs the brightest is selected.
+        Blobs within ±8px of the workspace crosshair are excluded.
+        """
+        # ── DEBUG: widened thresholds + console logging for first 100 calls ──
+        self._ee_debug_count = getattr(self, '_ee_debug_count', 0) + 1
+        debug_active = self._ee_debug_count <= 100
+        do_print     = debug_active and (self._ee_debug_count % 30 == 1)
+
+        if debug_active:
+            sat_max  = 80    # widened (config: EE_LASER_SAT_MAX=50)
+            val_min  = 180   # widened (config: EE_LASER_VAL_MIN=210)
+            max_area = 500   # widened (config: EE_LASER_MAX_AREA=300)
+        else:
+            sat_max  = int(config.EE_LASER_SAT_MAX)
+            val_min  = int(config.EE_LASER_VAL_MIN)
+            max_area = int(config.EE_LASER_MAX_AREA)
+        # ─────────────────────────────────────────────────────────────────────
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (0, 0, val_min), (180, sat_max, 255))
+
+        open_k  = 3
+        close_k = 5
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((open_k,  open_k),  np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
+
+        # Exclude ±8px around the workspace-centre crosshair (also white)
+        crosshair_px = None
+        if self.fx is not None:
+            ox = getattr(config, 'WORKSPACE_OVERLAY_X_OFFSET_MM', 0.0)
+            oy = getattr(config, 'WORKSPACE_OVERLAY_Y_OFFSET_MM', 0.0)
+            crosshair_px = self._project_base_to_pixel(ox, oy, config.WORKSPACE_PICK_Z_MM)
+        if crosshair_px is not None:
+            ccx, ccy = int(crosshair_px[0]), int(crosshair_px[1])
+            mh, mw = mask.shape[:2]
+            mask[max(0, ccy - 8):min(mh, ccy + 9),
+                 max(0, ccx - 8):min(mw, ccx + 9)] = 0
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        v_chan = hsv[:, :, 2]
+        best = None
+        best_brightness = 0.0
+        tmp_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        debug_areas = []
+        for c in contours:
+            area = float(cv2.contourArea(c))
+            passed = config.EE_LASER_MIN_AREA <= area <= max_area
+            if do_print:
+                debug_areas.append(f"{area:.0f}({'ok' if passed else 'skip'})")
+            if not passed:
+                continue
+            tmp_mask[:] = 0
+            cv2.drawContours(tmp_mask, [c], -1, 255, cv2.FILLED)
+            mean_v = float(cv2.mean(v_chan, mask=tmp_mask)[0])
+            if mean_v > best_brightness:
+                best_brightness = mean_v
+                best = c
+
+        # ── raw centroid from brightest passing blob ───────────────────────────
+        raw = None
+        if best is not None:
+            M = cv2.moments(best)
+            if M["m00"] != 0:
+                raw = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+
+        # ── workspace bounds filter (±20px around ws_poly bounding box) ───────
+        if raw is not None:
+            ws_poly = getattr(self, '_ws_poly', None)
+            if ws_poly is not None:
+                pts = ws_poly.reshape(-1, 2)
+                x_min = int(pts[:, 0].min()) - 20
+                x_max = int(pts[:, 0].max()) + 20
+                y_min = int(pts[:, 1].min()) - 20
+                y_max = int(pts[:, 1].max()) + 20
+                if not (x_min < raw[0] < x_max and y_min < raw[1] < y_max):
+                    raw = None
+
+        # ── temporal smoothing: jump filter + median over last N frames ────────
+        if not hasattr(self, '_ee_history'):
+            self._ee_history = deque(maxlen=config.EE_LASER_SMOOTH_FRAMES)
+
+        result = None
+        if raw is not None:
+            # Jump filter: reject if too far from last accepted position
+            if self._ee_history:
+                lx, ly = self._ee_history[-1]
+                jump = ((raw[0] - lx) ** 2 + (raw[1] - ly) ** 2) ** 0.5
+                if jump > config.EE_LASER_MAX_JUMP_PX:
+                    raw = None   # noise spike — discard
+
+        if raw is not None:
+            self._ee_history.append(raw)
+
+        if self._ee_history:
+            xs = sorted(p[0] for p in self._ee_history)
+            ys = sorted(p[1] for p in self._ee_history)
+            n  = len(xs)
+            result = (xs[n // 2], ys[n // 2])
+
+        if do_print:
+            xhair = (f"({int(crosshair_px[0])},{int(crosshair_px[1])})"
+                     if crosshair_px is not None else "None")
+            print(f"[EE debug #{self._ee_debug_count}]  "
+                  f"{len(contours)} contours  areas={debug_areas}  "
+                  f"crosshair_excl={xhair}  raw={raw}  result={result}")
+
+        return result
 
     def _build_T_cam_to_base(self):
         """Build the 4×4 homogeneous transform T_cam_to_base.
@@ -2384,24 +2578,22 @@ class DeltaCamera(Node):
         return float(parallel_xyz[0]), float(parallel_xyz[1]), float(parallel_xyz[2])
 
     def update_xyz_average(self, track_id: str, xyz_now):
-        if self.last_track_id != track_id:
-            self.xyz_buffer.clear()
-            self._timed_xyz_buf.clear()
-            self.last_stable_xyz = None
-            self.last_track_id = track_id
+        if track_id not in self._xyz_buffers:
+            self._xyz_buffers[track_id] = deque(maxlen=config.AVG_FRAME_COUNT)
+            self._timed_xyz_bufs[track_id] = deque(maxlen=config.AVG_FRAME_COUNT)
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
-        self.xyz_buffer.append(xyz_now)
-        self._timed_xyz_buf.append((now_sec, xyz_now[0], xyz_now[1], xyz_now[2]))
+        self._xyz_buffers[track_id].append(xyz_now)
+        self._timed_xyz_bufs[track_id].append((now_sec, xyz_now[0], xyz_now[1], xyz_now[2]))
 
-        if len(self.xyz_buffer) < config.AVG_FRAME_COUNT:
+        if len(self._xyz_buffers[track_id]) < config.AVG_FRAME_COUNT:
             return None
 
-        arr = np.array(self.xyz_buffer, dtype=np.float64)
+        arr = np.array(self._xyz_buffers[track_id], dtype=np.float64)
         xyz_avg = np.median(arr, axis=0)
         return float(xyz_avg[0]), float(xyz_avg[1]), float(xyz_avg[2])
 
-    def _estimate_vy(self) -> float:
+    def _estimate_vy(self, timed_buf=None) -> float:
         """Estimate conveyor velocity along Y axis (mm/s).
 
         Uses linear regression over the timed XYZ buffer.  The result is
@@ -2411,10 +2603,11 @@ class DeltaCamera(Node):
                                                    fall back to design speed.
         Sign is negative (belt moves in –Y direction).
         """
-        if len(self._timed_xyz_buf) < 3:
+        buf_src = timed_buf if timed_buf is not None else deque()
+        if len(buf_src) < 3:
             return 0.0
 
-        buf = np.array(self._timed_xyz_buf, dtype=np.float64)
+        buf = np.array(buf_src, dtype=np.float64)
         t   = buf[:, 0] - buf[0, 0]
         y   = buf[:, 2]
         A   = np.vstack([t, np.ones(len(t))]).T
@@ -2665,6 +2858,54 @@ class DeltaCamera(Node):
 
         print("------------------------------------------")
         self.last_fake_move_time = now
+
+    def _calibrate_offset_srv(self, request, response):
+        self.run_cam_offset_calibration()
+        response.success = True
+        response.message = "Calibration started — results printed after 30 detections"
+        return response
+
+    def run_cam_offset_calibration(self) -> None:
+        """
+        Start camera offset calibration.
+        Place an object at the physical robot centre (X=0, Y=0) before calling.
+        After 30 detected frames the node prints the required CAM_TX_MM / CAM_TY_MM
+        corrections. The robot is not moved.
+        """
+        self._cal_samples = []
+        self._cal_active = True
+        self.get_logger().info(
+            "Cam offset calibration started — place object at robot centre (X=0, Y=0). "
+            "Collecting 30 detections..."
+        )
+
+    def _collect_cal_sample(self, best: dict) -> None:
+        if not self._cal_active:
+            return
+        self._cal_samples.append((best["x_base"], best["y_base"]))
+        n = len(self._cal_samples)
+        if n < 30:
+            if n % 5 == 0:
+                self.get_logger().info(f"Calibration: {n}/30 samples...")
+            return
+        self._cal_active = False
+        mean_x = sum(s[0] for s in self._cal_samples) / n
+        mean_y = sum(s[1] for s in self._cal_samples) / n
+        new_tx = config.CAM_TX_MM - mean_x
+        new_ty = config.CAM_TY_MM - mean_y
+        self.get_logger().info(
+            f"\n====== CAM OFFSET CALIBRATION RESULT ======\n"
+            f"  Samples     : {n}\n"
+            f"  mean x_base : {mean_x:+.2f} mm\n"
+            f"  mean y_base : {mean_y:+.2f} mm\n"
+            f"  Corrections needed:\n"
+            f"    CAM_TX_MM  {config.CAM_TX_MM:.2f} + ({-mean_x:+.2f}) = {new_tx:.2f}\n"
+            f"    CAM_TY_MM  {config.CAM_TY_MM:.2f} + ({-mean_y:+.2f}) = {new_ty:.2f}\n"
+            f"  → Update config.py:\n"
+            f"    CAM_TX_MM = {new_tx:.2f}\n"
+            f"    CAM_TY_MM = {new_ty:.2f}\n"
+            f"==========================================="
+        )
 
     def destroy_node(self):
         if self.VIEW_IMAGE:

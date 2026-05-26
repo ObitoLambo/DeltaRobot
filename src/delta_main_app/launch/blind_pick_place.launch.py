@@ -8,7 +8,8 @@ DeltaMotorController opens its RobstrideBus socket.
 """
 
 from launch import LaunchDescription
-from launch.actions import TimerAction
+from launch.actions import TimerAction, ExecuteProcess, RegisterEventHandler
+from launch.event_handlers import OnProcessExit
 from launch_ros.actions import Node
 
 
@@ -27,9 +28,20 @@ def generate_launch_description():
         output='screen',
     )
 
+    can_down = ExecuteProcess(
+        cmd=['sudo', 'ip', 'link', 'set', 'can0', 'down'],
+        output='screen',
+    )
+
     return LaunchDescription([
         can_driver,
         # Wait for can_driver to bring up can0 before the motor controller
         # tries to open its own socketcan socket on the same interface.
         TimerAction(period=8.0, actions=[blind_pick_place]),
+        RegisterEventHandler(
+            OnProcessExit(
+                target_action=blind_pick_place,
+                on_exit=[can_down],
+            )
+        ),
     ])
