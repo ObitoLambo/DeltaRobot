@@ -11,6 +11,7 @@ This guide is for developers continuing work on this codebase. It assumes you ha
 3. [Motor Controller](#3-motor-controller)
 4. [Pneumatic Gripper](#4-pneumatic-gripper)
 5. [Pick-and-Place FSM](#5-pick-and-place-fsm)
+   - 5a. [Belt Predictor](#5a-belt-predictor--delta_main_appbelt_predictorpy)
 6. [Vision System](#6-vision-system)
 7. [Custom ROS Messages](#7-custom-ros-messages)
 8. [delta_common — Shared Library](#8-delta_common--shared-library)
@@ -224,8 +225,8 @@ Camera confirmation is handled **inside the camera node** (conveyor mode: `CONVE
 
 ```
 /delta/all_targets  →  _all_targets_callback  (sorts candidates by distance from base origin, queues all)
-                    →  _queue_timer (10 Hz)   (pops queue, applies Y-prediction: y_pred = y + vy × t_travel)
-                    →  fsm.force_target(x, y_pred, z)  (starts sequence immediately — no CONFIRMING state)
+                    →  _queue_timer (10 Hz)   (pops queue, runs BeltPredictor.predict() → y_pick)
+                    →  fsm.force_target(x, y_pick, z)  (starts sequence immediately — no CONFIRMING state)
 ```
 
 The `CONFIRMING` state exists in `PickAndPlaceStateMachine` but is **not used** by `main_app.py`. `force_target()` bypasses it and starts the pick sequence directly.
@@ -237,8 +238,10 @@ IDLE
  │  force_target() called by _queue_timer
  ▼
 APPROACHING   move(x, y, z+25)     ← 25 mm above object; skipped if IK fails at that Z
+ │            sleep(CONVEYOR_APPROACH_WAIT_SEC)   ← wait for object to arrive under arm
+ │            [EE correction loop if EE_CORRECTION_ENABLE]
  ▼
-PICKING       move(x, y, z)        ← descend to object surface
+PICKING       move(x, y, z)        ← descend to object surface  (EE_PICK_SPEED_MODE)
  ▼
 GRASPING      gripper CLOSE        ← wait 0.4 s
  ▼
@@ -253,13 +256,79 @@ RESETTING     move(0, 0, -350)     ← home, raw=True (EE_OFFSET skipped)
 IDLE
 ```
 
+**EE correction loop (during APPROACHING):**
+
+When `EE_CORRECTION_ENABLE = True`, after the robot pre-positions at approach Z the FSM runs a closed-loop correction using the camera's EE marker tracking:
+
+```
+for i in range(EE_CORRECTION_MAX_ITERS):
+    wait EE_CORRECTION_WAIT_S for a fresh /delta/ee_error_mm sample
+    if |err_x| < EE_CORRECTION_MIN_MM  → stop (close enough)
+    if |err_x| < EE_CORRECTION_THRESH_MM → stop (converged)
+    if elapsed > EE_CORRECTION_TIMEOUT_S  → give up and pick
+    x_new = x - err_x × EE_CORRECTION_GAIN
+    move(x_new, y, approach_z)
+then switch to EE_PICK_SPEED_MODE and descend
+```
+
+The camera publishes EE error on `/delta/ee_error_mm` (PointStamped). `DeltaMainApp` smooths it exponentially (alpha = `EE_CORRECTION_ALPHA`) and forwards it to the FSM via `update_ee_error()`.
+
+**Subscriptions / publications added in this version:**
+
+| Direction | Topic | Type | Purpose |
+|---|---|---|---|
+| sub | `/delta/all_targets` | `PoseArray` | Detected object positions (m, converted to mm) |
+| sub | `/delta/object_velocity_mm_s` | `PointStamped` | Belt velocity from camera |
+| sub | `/delta/detection_status` | `String` | Camera state (unused by FSM; available for UI) |
+| sub | `/delta/ee_error_mm` | `PointStamped` | EE position error from camera |
+| pub | `/delta/gripper_cmd` | `Float32` | 0.0=open, 1.0=closed |
+| pub | `/delta/robot_state` | `String` | Current FSM state name |
+
+---
+
+## 5a. Belt Predictor — `delta_main_app/belt_predictor.py`
+
+**Class:** `BeltPredictor`
+
+Estimates belt velocity via linear regression on a rolling 2-second window of `(timestamp, y_mm)` samples, then predicts the object's Y position when the robot EEF actually arrives.
+
+```python
+from delta_main_app.belt_predictor import BeltPredictor
+
+predictor = BeltPredictor()
+
+# Feed a new observation on every camera frame
+predictor.update_velocity(y_mm=45.3, timestamp=time.time())
+
+# Query predicted pick point
+result = predictor.predict(x_mm=10.0, y_mm=45.3, current_robot_y=0.0)
+# result.y_pick    — predicted Y at pick time (mm)
+# result.valid     — False if predicted point is outside workspace
+# result.t_total   — estimated travel + descend time (s)
+# result.belt_offset — how far the belt moves during travel (mm)
+# result.vy_mm_s  — estimated velocity (mm/s, negative = toward EXIT)
+
+predictor.clear()  # reset on new object / idle period
+```
+
+**Timing model (triangular profile):**
+
+```
+t_descend = 2 × sqrt(DESCEND_DIST_MM / TRAJ_A_MAX_MM_S2)   # 60 mm descend
+t_travel  = 2 × sqrt(|y_pick − robot_y| / TRAJ_A_MAX_MM_S2) # iterates 4×
+t_total   = LATENCY_S + t_travel + t_descend
+y_pick    = y_detected + vy × t_total
+```
+
+Velocity is clamped to `[CONVEYOR_VY_MIN_MM_S, CONVEYOR_VY_MAX_MM_S]`. If fewer than 5 samples exist, falls back to `−CONVEYOR_BELT_SPEED_MM_S` (config constant).
+
 ---
 
 ## 6. Vision System
 
 ### `delta_camera_system/camera_system.py`
 
-Subscribes to RealSense topics and runs object detection. Publishes the detected object's 3D position in the robot base frame.
+Subscribes to RealSense topics and runs object detection. Publishes the detected object's 3D position in the robot base frame, plus EE marker position and error.
 
 **Detection modes** (set `DETECTION_MODE` in `config.py`):
 
@@ -287,14 +356,42 @@ Camera frame XYZ (mm)  via pixel_to_camera_xyz_mm(u, v, z_m)
     │ T_cam_to_base: CAMERA_DIRECT_MATRIX (3×3) + CAM_TX/TY/TZ_MM translation
     ▼
 Robot base frame XYZ (mm)
-    │ averaged over AVG_FRAME_COUNT=7 frames (median)
+    │ averaged over AVG_FRAME_COUNT=7 frames (median), per-track buffers (_xyz_buffers)
     │ check_workspace() → reject if outside ±X_LIMIT / ±Y_LIMIT / Z range
     ▼
-Conveyor velocity:  linear regression over _timed_xyz_buf → vy (mm/s)
+Conveyor velocity:  linear regression over _timed_xyz_bufs (per track) → vy (mm/s)
     published on /delta/object_velocity_mm_s (PointStamped)
     ▼
-Published on /delta/all_targets (PoseArray) — all allowed detections
+Published on /delta/all_targets (PoseArray) — all allowed detections (units: metres)
 ```
+
+**EE marker detection (white laser dot on gripper tip):**
+
+Runs every frame independently of object detection. Detects a bright white blob using HSV thresholds (`EE_LASER_SAT_MAX`, `EE_LASER_VAL_MIN`) → filters by area → smooths over `EE_LASER_SMOOTH_FRAMES` frames.
+
+```
+EE pixel (eu, ev)
+    │ depth from aligned depth image (8px sample window) or FAKE_DEPTH_M fallback
+    ▼
+EE position in base frame → published on /delta/ee_position_mm (PointStamped)
+
+EE error = EE_base_xy − target_xy → published on /delta/ee_error_mm (PointStamped)
+```
+
+`measure_error_grid.py` subscribes to `/delta/ee_position_mm` to automatically measure landing error at each grid point.
+
+**Publishers:**
+
+| Topic | Type | Content |
+|---|---|---|
+| `/delta/all_targets` | `PoseArray` | All confirmed object detections (metres) |
+| `/delta/target_xyz` | `PointStamped` | Best single detection (mm) |
+| `/delta/object_velocity_mm_s` | `PointStamped` | Belt velocity vy (mm/s) |
+| `/delta/detection_status` | `String` | Detection state string |
+| `/delta/ee_position_mm` | `PointStamped` | EE marker in base frame (mm) |
+| `/delta/ee_error_mm` | `PointStamped` | EE position error vs target (mm) |
+
+**Service:** `/delta/calibrate_cam_offset` (Trigger) — runs an interactive offset calibration routine.
 
 **Camera transform matrix** (`config.py`):
 
@@ -304,9 +401,9 @@ CAMERA_DIRECT_MATRIX = (
     ( 0.0,  1.0,  0.0),   # camera +Y  → robot +Y
     ( 0.0,  0.0, -1.0),   # camera +Z  → robot −Z
 )
-CAM_TX_MM = 0.0    # not yet calibrated
-CAM_TY_MM = 0.0    # TODO: calibrate — Y-offset of camera from base origin
-CAM_TZ_MM = 352.0  # measured: camera height above belt surface at pick Z≈−380 mm
+CAM_TX_MM = -5.0    # tuned: adjust in ±10mm steps until object centres correctly in X
+CAM_TY_MM = +305.0  # calibrated: +57mm correction applied on top of physical mount offset
+CAM_TZ_MM =  352.0  # measured: z_cam ≈ 762 mm to belt surface at pick_z ≈ −410 mm
 ```
 
 If the detected positions are systematically offset, adjust `CAM_TX_MM / CAM_TY_MM / CAM_TZ_MM` or use `CAM_FINE_ROLL/PITCH/YAW_DEG` for fine rotation.
@@ -379,10 +476,51 @@ Central place for **all** tunable parameters. Do not hardcode magic numbers in o
 Flags useful during development:
 
 ```python
-ENABLE_MOTORS = False   # disables all CAN output → safe for desk testing
-AUTO_MOVE     = False   # camera detects but arm stays still
-VISION_ONLY_ENABLE = True   # camera node runs without robot
-PURE_CAMERA_TEST_ENABLE = True
+ENABLE_MOTORS = False          # disables all CAN output → safe for desk testing
+AUTO_MOVE     = False          # camera detects but arm stays still
+VISION_ONLY_ENABLE = True      # camera node runs without robot
+PURE_CAMERA_TEST_ENABLE = True # minimal camera test without detection pipeline
+FAKE_DEPTH_ENABLE = True       # use FAKE_DEPTH_M instead of RealSense depth
+FAKE_OBJ_ENABLE = True         # inject fixed object position for EE correction testing
+```
+
+**Conveyor-mode parameters:**
+
+```python
+CONVEYOR_MODE = True                  # skip stability check; object is always moving
+CONVEYOR_BELT_SPEED_MM_S = 12.85     # fallback belt speed when regression has too few samples
+CONVEYOR_VY_MIN_MM_S = 1.0           # below this → treat as stopped (vy=0)
+CONVEYOR_VY_MAX_MM_S = 25.0          # above this → clamp to design speed
+CONVEYOR_APPROACH_WAIT_SEC = 0.3     # extra wait at approach Z for object to arrive
+TARGET_PUBLISH_COOLDOWN_SEC = 3.0    # minimum interval between consecutive target publishes
+TRAJ_A_MAX_MM_S2 = 5000.0            # triangular profile acceleration (used by BeltPredictor)
+PLACE_X, PLACE_Y, PLACE_Z = 0.0, -150.0, -410.0  # drop location (belt exit edge)
+```
+
+**EE correction parameters:**
+
+```python
+EE_CORRECTION_ENABLE    = True    # close-loop EE correction during APPROACHING
+EE_CORRECTION_MAX_MM    = 50.0    # ignore correction if error is larger than this
+EE_CORRECTION_ALPHA     = 0.3     # exponential smoothing for running EE error average
+EE_CORRECTION_GAIN      = 0.6     # fraction of error to correct per step
+EE_CORRECTION_THRESH_MM = 5.0     # converge threshold
+EE_CORRECTION_MIN_MM    = 3.0     # skip micro-adjustments below this
+EE_CORRECTION_MAX_ITERS = 3       # maximum correction moves per pick
+EE_CORRECTION_TIMEOUT_S = 2.0     # give up after this many seconds
+EE_CORRECTION_WAIT_S    = 0.5     # wait for fresh EE error after each correction move
+EE_CORRECTION_SPEED_MODE = 'low'  # speed preset during correction
+EE_PICK_SPEED_MODE       = 'medium'  # speed preset for descent
+```
+
+**Grid error-map parameters:**
+
+```python
+ERROR_MAP_ENABLE = False                               # apply per-point correction from file
+ERROR_MAP_FILE   = "/home/s4mb4th/delta_ws/error_map.json"  # built by measure_error_grid.py
+EE_OFFSET_X_MM   = 0.0    # static offset (used when ERROR_MAP_ENABLE=False)
+EE_OFFSET_Y_MM   = 0.0
+EE_OFFSET_Z_MM   = 0.0
 ```
 
 ---
@@ -460,6 +598,26 @@ EOF
 2. Run: `ros2 run delta_camera_system calibrate_camera_transform`
 3. The script computes the rotation matrix and translation vector
 4. Update `CAMERA_DIRECT_MATRIX`, `CAM_TX_MM`, `CAM_TY_MM`, `CAM_TZ_MM` in `config.py`
+
+Current calibrated values: `CAM_TX_MM = -5.0`, `CAM_TY_MM = +305.0`, `CAM_TZ_MM = 352.0`.
+
+### Grid error map — `measure_error_grid.py`
+
+Automatically sweeps a 9×9 grid (`GRID_X = [-120…+120 mm]`, `GRID_Y = [-120…+120 mm]`) at `MARK_Z = -410 mm`, measures where the EE actually lands using the camera's EE marker detection (`/delta/ee_position_mm`), and saves corrections to `error_map.json`.
+
+```bash
+# Requires camera node running (for /delta/ee_position_mm)
+python3 measure_error_grid.py             # real sweep
+python3 measure_error_grid.py --dry-run   # print grid without moving
+```
+
+After running, enable in `config.py`:
+```python
+ERROR_MAP_ENABLE = True
+ERROR_MAP_FILE   = "/home/s4mb4th/delta_ws/error_map.json"
+```
+
+The `error_map` module in `delta_common` interpolates the correction for any XY point at runtime.
 
 ### Plane homography (optional)
 
@@ -539,8 +697,8 @@ ip link show can0
 ### IK returns non-zero status
 
 The requested (x, y, z) position has no valid solution. Common causes:
-- Z too shallow (close to base) — try more negative Z
-- XY too large — stay within ±151 mm
+- Z too shallow (close to base) — try more negative Z. The IK ceiling at centre is `Z_MAX = -323.0 mm`; anything above that fails IK. The old value of `-196.875 mm` in comments is geometrically wrong — ignore it.
+- XY too large — stay within ±150 mm (`X_LIMIT / Y_LIMIT`)
 - Joint limits exceeded even if workspace check passes — run `delta_calcInverse` manually and inspect angles
 
 ### ROS messages not found after adding a new `.msg` file
