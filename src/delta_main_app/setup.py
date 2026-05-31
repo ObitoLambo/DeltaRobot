@@ -31,6 +31,7 @@ setup(
             'laser_preview             = delta_main_app.laser_preview:main',
             'repeatability_test        = delta_main_app.repeatability_test:main',
             'workspace_accuracy_sweep  = delta_main_app.workspace_accuracy_sweep:main',
+            'matlab_bridge            = delta_main_app.matlab_bridge_node:main',
         ],
     },
 )

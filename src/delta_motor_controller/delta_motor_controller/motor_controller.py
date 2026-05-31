@@ -148,6 +148,72 @@ class DeltaMotorController:
 
         return err < self.POS_TOL_MM, ik_deg, fb_deg, fk_xyz, err
 
+    def move_thetas(self, t1: float, t2: float, t3: float):
+        """Command motors to joint angles supplied by an external IK source (e.g. MATLAB).
+
+        Bypasses the internal IK solver. Joint limits are still enforced.
+
+        Parameters
+        ----------
+        t1, t2, t3 : degrees
+
+        Returns
+        -------
+        (ok, fk_xyz, err)
+            ok      : True if FK settled within POS_TOL_MM
+            fk_xyz  : (x, y, z) mm from FK at final feedback position
+            err     : residual FK error in mm
+        """
+        if not self.within_joint_limits(t1, t2, t3):
+            print(f"Joint limit reject: ({t1:.1f},{t2:.1f},{t3:.1f})")
+            return False, None, float('inf')
+
+        st_ref, x_ref, y_ref, z_ref = delta_calcForward(t1, t2, t3, e, f, re, rf)
+        if st_ref != 0:
+            print(f"FK failed for commanded thetas ({t1:.1f},{t2:.1f},{t3:.1f})")
+            return False, None, float('inf')
+
+        print(
+            f"\nThetas -> ({t1:.2f}°, {t2:.2f}°, {t3:.2f}°)  "
+            f"FK target=({x_ref:.2f},{y_ref:.2f},{z_ref:.2f}) mm"
+        )
+
+        target_radians = [math.radians(t) for t in (t1, t2, t3)]
+        for name, rad in zip(self.MOTOR_NAMES, target_radians):
+            self.bus.write(name, ParameterType.POSITION_TARGET, float(rad))
+
+        POLL_INTERVAL = 0.020
+        deadline = time.time() + self.VERIFY_DELAY
+        fk_xyz = None
+        err = float('inf')
+
+        while True:
+            time.sleep(POLL_INTERVAL)
+            feedback_radians = [
+                float(self.bus.read(name, ParameterType.MECHANICAL_POSITION))
+                for name in self.MOTOR_NAMES
+            ]
+            fb_deg = tuple(math.degrees(v) for v in feedback_radians)
+            st_fk, x_fk, y_fk, z_fk = delta_calcForward(
+                fb_deg[0], fb_deg[1], fb_deg[2], e, f, re, rf
+            )
+            if st_fk != 0:
+                if time.time() >= deadline:
+                    return False, None, float('inf')
+                continue
+
+            fk_xyz = (x_fk, y_fk, z_fk)
+            err = math.sqrt(
+                (x_ref - x_fk) ** 2 + (y_ref - y_fk) ** 2 + (z_ref - z_fk) ** 2
+            )
+            if err < self.POS_TOL_MM:
+                break
+            if time.time() >= deadline:
+                break
+
+        print(f"FK actual=({x_fk:.2f},{y_fk:.2f},{z_fk:.2f}) | err={err:.2f}mm")
+        return err < self.POS_TOL_MM, fk_xyz, err
+
     def get_current_xyz(self):
         """Read joint positions via CAN feedback and return the FK result.
 
