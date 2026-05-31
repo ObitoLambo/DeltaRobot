@@ -84,7 +84,7 @@ class DeltaMotorController:
             elif config.EE_OFFSET_X_MM or config.EE_OFFSET_Y_MM or config.EE_OFFSET_Z_MM:
                 x += config.EE_OFFSET_X_MM
                 y += config.EE_OFFSET_Y_MM
-                z += config.EE_OFFSET_Z_MM
+                z -= config.EE_OFFSET_Z_MM
                 print(f"EE offset applied -> ({x:.2f}, {y:.2f}, {z:.2f})")
 
         if not check_workspace(x, y, z):

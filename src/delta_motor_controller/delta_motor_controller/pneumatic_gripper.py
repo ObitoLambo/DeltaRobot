@@ -1,89 +1,103 @@
 #!/usr/bin/env python3
 """
-pneumatic_gripper.py — Pneumatic solenoid gripper via can_driver ROS topic.
+pneumatic_gripper.py — Pneumatic solenoid gripper for delta pick-and-place.
 
-Publishes DigitalAndSolenoidCommand to /publish_digital_solenoid which is
-consumed by can_driver_node.  No direct CAN access — can_driver owns the bus.
+Sends CAN frames directly via python-can (socketcan) — no can_driver_node needed.
+
+CAN frame format (reverse-engineered from can_driver.py):
+    arbitration_id = can_id (4)
+    data[0] = 0x40
+    data[1] = digital bitmask (unused here, always 0)
+    data[2] = solenoid bitmask (bit 0 = solenoid1)
+    is_extended_id = False
+
+Hardware convention (verified with testing_solenoid.py):
+    solenoid1_value = True  →  GRIP
+    solenoid1_value = False →  RELEASE
 """
 
 import time
-
-from custom_messages.msg import DigitalAndSolenoidCommand
+import can
 
 
 class PneumaticGripper:
     """
-    Gripper controller that routes commands through can_driver.
+    Gripper controller for delta robot pick-and-place.
+    Sends CAN frames directly — no ROS topic or can_driver_node required.
 
     Parameters
     ----------
-    node            : rclpy.node.Node — parent ROS 2 node (provides publisher)
-    can_id          : int             — CAN ID of the solenoid board (default 4)
-    close_settle_s  : float           — seconds to wait after closing (default 0.5)
-    open_settle_s   : float           — seconds to wait after opening  (default 0.3)
+    can_channel   : str   — SocketCAN channel (default 'can0')
+    can_id        : int   — CAN ID of solenoid board (default 4)
+    grip_settle_s : float — wait after grip command   (default 0.5 s)
+    open_settle_s : float — wait after release command (default 0.3 s)
     """
 
-    def __init__(self, node, can_id: int = 4,
-                 close_settle_s: float = 0.5,
+    def __init__(self, can_channel: str = 'can0', can_id: int = 4,
+                 grip_settle_s: float = 0.5,
                  open_settle_s: float = 0.3):
-        self._node = node
+        self._can_channel = can_channel
         self._can_id = can_id
-        self._close_settle_s = close_settle_s
+        self._grip_settle_s = grip_settle_s
         self._open_settle_s = open_settle_s
-        self._publisher = None
+        self._bus = None
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
 
     def connect(self) -> None:
-        """Create the publisher and publish an initial open command (safe state)."""
-        self._publisher = self._node.create_publisher(
-            DigitalAndSolenoidCommand,
-            '/publish_digital_solenoid',
-            10,
+        """Open CAN bus and send initial release command (safe state)."""
+        self._bus = can.interface.Bus(
+            interface='socketcan',
+            channel=self._can_channel,
+            bitrate=1000000,
         )
-        self._publish(closed=False)
+        self.release(wait=False)
 
     def disconnect(self) -> None:
-        """Open the gripper (safety release) and tear down the publisher."""
-        if self._publisher is not None:
-            self._publish(closed=False)
-            self._node.destroy_publisher(self._publisher)
-            self._publisher = None
+        """Release gripper and close CAN bus."""
+        if self._bus is not None:
+            self.release(wait=False)
+            self._bus.shutdown()
+            self._bus = None
 
     # ── control ────────────────────────────────────────────────────────────────
 
-    def close(self, wait: bool = True) -> None:
-        """Energise the solenoid (grip).
-
-        Parameters
-        ----------
-        wait : bool
-            If True, block for close_settle_s to allow pneumatics to actuate.
-        """
-        self._publish(closed=True)
+    def grip(self, wait: bool = True) -> None:
+        """Activate suction / close jaws to hold the object."""
+        self._send(solenoid1=True)
         if wait:
-            time.sleep(self._close_settle_s)
+            time.sleep(self._grip_settle_s)
 
-    def open(self, wait: bool = True) -> None:
-        """De-energise the solenoid (release).
-
-        Parameters
-        ----------
-        wait : bool
-            If True, block for open_settle_s to allow pneumatics to retract.
-        """
-        self._publish(closed=False)
+    def release(self, wait: bool = True) -> None:
+        """Deactivate suction / open jaws to drop the object."""
+        self._send(solenoid1=False)
         if wait:
             time.sleep(self._open_settle_s)
 
+    # ── backward-compatible aliases ────────────────────────────────────────────
+
+    def close(self, wait: bool = True) -> None:
+        self.grip(wait=wait)
+
+    def open(self, wait: bool = True) -> None:
+        self.release(wait=wait)
+
     # ── internal ───────────────────────────────────────────────────────────────
 
-    def _publish(self, closed: bool) -> None:
-        if self._publisher is None:
-            self._node.get_logger().warn(
-                'PneumaticGripper: publish called before connect()')
+    def _send(self, solenoid1: bool = False, solenoid2: bool = False) -> None:
+        if self._bus is None:
+            print('PneumaticGripper: send called before connect()')
             return
-        msg = DigitalAndSolenoidCommand()
-        msg.can_id = self._can_id
-        msg.solenoid1_value = closed
-        self._publisher.publish(msg)
+        data = [0] * 8
+        data[0] = 0x40
+        data[1] = 0                           # digital bits (unused)
+        data[2] = int(solenoid1) | (int(solenoid2) << 1)
+        msg = can.Message(
+            arbitration_id=self._can_id,
+            data=data,
+            is_extended_id=False,
+        )
+        try:
+            self._bus.send(msg)
+        except can.CanError as e:
+            print(f'PneumaticGripper: CAN send failed: {e}')

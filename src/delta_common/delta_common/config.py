@@ -137,14 +137,14 @@ BOX_POLY_EPSILON_SCALE = 0.04
 BOX_MIN_RECTANGULARITY = 0.72
 BOX_MAX_ASPECT_RATIO = 3.0
 
-AVG_FRAME_COUNT = 7
+AVG_FRAME_COUNT = 5              # 5 frames: less lag on conveyor, still smooth
 CENTER_WINDOW = 5
 TRACK_GRID_PX = 80
 # Larger grid for conveyor mode: object moves ~2-4 px/frame so 160 px gives
 # ~40-80 stable frames per cell before the track ID resets at a boundary.
 CONVEYOR_TRACK_GRID_PX = 160
-DETECTION_CONFIRM_FRAMES = 2
-DETECTION_LOST_RESET_FRAMES = 5
+DETECTION_CONFIRM_FRAMES = 2     # 2 frames: faster trigger, still avoids false positives
+DETECTION_LOST_RESET_FRAMES = 8  # hold on longer before resetting — avoids flicker
 
 STABLE_THRESH_X_MM = 1.5
 STABLE_THRESH_Y_MM = 1.5
@@ -162,10 +162,15 @@ DEPTH_MAD_SCALE = 2.0
 DEPTH_HISTORY_SIZE = 7
 DEPTH_MAX_JUMP_M = 0.015
 
+# Home position — workspace centre, mid-height
+HOME_X =   0.0
+HOME_Y =   0.0
+HOME_Z = -350.0
+
 # Drop at belt exit edge — Y = -150mm
 PLACE_X =   0.0
 PLACE_Y = -150.0
-PLACE_Z = -410.0   # if IK returns st=-1, raise to -390.0 or -380.0
+PLACE_Z = -490.0   # platform Z for drop-off (EE tip 150mm below = -650mm physical)
 
 # Acceleration used for triangular travel-time prediction (medium preset).
 # Within ±150mm workspace all moves are triangular: t = 2*sqrt(dist / TRAJ_A_MAX_MM_S2)
@@ -174,20 +179,24 @@ TRAJ_A_MAX_MM_S2 = 5000.0
 # Extra wait at approach Z (mm above object) after robot pre-positions.
 # Gives the object time to arrive if Y prediction is still slightly off.
 # Increase in small steps (0.1 s) if robot still arrives before object.
-CONVEYOR_APPROACH_WAIT_SEC = 0.3
+CONVEYOR_APPROACH_WAIT_SEC = 1.0
 
 # Static EE correction offsets (mm).  Measure the real error at your target
 # position and set each offset to negate it: if the EE lands 10 mm too far in
 # +X, set EE_OFFSET_X_MM = -10.0.
 EE_OFFSET_X_MM = 0.0
 EE_OFFSET_Y_MM = 0.0
-EE_OFFSET_Z_MM = 0.0    
+EE_OFFSET_Z_MM   = -60.0  # camera now reports platform Z directly via FAKE_DEPTH_M=0.530
+PICK_Z_EXTRA_MM  = -65.0  # extra descent at pick (negative = deeper); tune in ±5mm steps
+PLACE_Z_EXTRA_MM = -65.0  # extra descent at place (negative = deeper); tune in ±5mm steps
 
 # Grid error map (replaces static EE_OFFSET when enabled).
 # Build the map with measure_error_grid.py, then flip this to True.
 ERROR_MAP_ENABLE = False
 ERROR_MAP_FILE   = "/home/s4mb4th/delta_ws/error_map.json"
 
+MOTOR_VEL_MAX    = 3.0   # PP mode max velocity — increase for faster moves (was 1.0)
+MOTOR_ACC_SET    = 5.0   # PP mode acceleration — increase for snappier starts (was 2.0)
 FK_VERIFY_TOL_MM = 3.0
 PRINT_COOLDOWN_SEC = 1.0
 FAKE_MOVE_COOLDOWN_SEC = 1.0
@@ -197,7 +206,9 @@ MOVE_COOLDOWN_SEC = 1.5
 MOVE_THRESHOLD_MM = 4.0
 
 FAKE_DEPTH_ENABLE = True
-FAKE_DEPTH_M = 0.762   # z_cam = CAM_TZ_MM(352) + |pick_z|(410) = 762 mm
+FAKE_DEPTH_M = 0.530
+# z_base = -530 + CAM_TZ_MM(-20) = -550mm = belt surface
+# z_platform = -550 - EE_OFFSET_Z_MM(-60) = -490mm
 
 # Fixed fake object position for testing EE correction
 # Set FAKE_OBJ_ENABLE = True to use fixed position
@@ -205,10 +216,10 @@ FAKE_DEPTH_M = 0.762   # z_cam = CAM_TZ_MM(352) + |pick_z|(410) = 762 mm
 FAKE_OBJ_ENABLE = False
 FAKE_OBJ_X_MM   =  0.0   # robot base frame mm
 FAKE_OBJ_Y_MM   =  0.0   # center of workspace
-FAKE_OBJ_Z_MM   = -410.0 # belt surface
+FAKE_OBJ_Z_MM   = -490.0 # belt surface (EE tip level)
 
 VISION_ONLY_ENABLE = False
-SIMPLE_RESULT_PRINT = True
+SIMPLE_RESULT_PRINT = False
 PURE_CAMERA_TEST_ENABLE = False
 
 # Conveyor belt mode: skip stability check (object is always moving).
@@ -235,27 +246,31 @@ TARGET_PUBLISH_COOLDOWN_SEC = 3.0
 # Projects the robot reachable square (±X_LIMIT, ±Y_LIMIT) at WORKSPACE_PICK_Z_MM
 # and draws three coloured zones: approach (amber), workspace (green), exit (red).
 DRAW_WORKSPACE_ZONES = True
-WORKSPACE_PICK_Z_MM  = -410.0   # belt surface Z in robot base frame (mm)
+WORKSPACE_PICK_Z_MM  = -490.0   # platform Z at pick height (EE tip 150mm below = belt)
 
 # EE marker detection (white laser dot on end-effector tip)
 EE_CORRECTION_ENABLE    = True
-EE_CORRECTION_MAX_MM    = 50.0   # ignore correction if error exceeds this
-EE_CORRECTION_ALPHA     = 0.3    # exponential smoothing factor (node-side running average)
-EE_CORRECTION_GAIN      = 0.6    # proportional gain — apply this fraction of error per step
-EE_CORRECTION_THRESH_MM = 5.0    # stop loop when EE is within this distance (mm)
-EE_CORRECTION_MIN_MM    = 3.0    # ignore errors smaller than this (no micro-adjustments)
-EE_CORRECTION_MAX_ITERS = 3      # maximum correction iterations per pick
-EE_CORRECTION_TIMEOUT_S = 2.0    # give up and pick anyway after this many seconds
-EE_CORRECTION_WAIT_S    = 0.5    # wait for fresh EE error after each correction move
-EE_CORRECTION_SPEED_MODE = 'low'    # speed preset during correction loop
-EE_PICK_SPEED_MODE       = 'medium' # speed preset during pick descent
-
-EE_LASER_SAT_MAX       = 50    # white = any hue, low saturation
-EE_LASER_VAL_MIN       = 210   # white = very bright
-EE_LASER_MIN_AREA      = 3
-EE_LASER_MAX_AREA      = 300
-EE_LASER_MAX_JUMP_PX   = 50    # reject detection if it jumps > this many px
-EE_LASER_SMOOTH_FRAMES = 3     # median over this many recent valid positions
+EE_CORRECTION_MAX_MM    = 60.0   # ignore correction if error exceeds this
+EE_CORRECTION_ALPHA     = 0.3    # exponential smoothing factor
+EE_CORRECTION_GAIN      = 0.3    # small steps → smooth motion, no overshoot
+EE_CORRECTION_THRESH_MM = 5.0    # above noise floor (±3-4mm)
+EE_CORRECTION_MIN_MM    = 2.0    # ignore sub-2mm errors
+EE_CORRECTION_MAX_ITERS = 10     # more iters of small steps = smooth convergence
+EE_CORRECTION_TIMEOUT_S = 15.0   # 10 iters × ~1.5s each
+EE_CORRECTION_WAIT_S    = 0.2    # short settle — small moves settle fast
+EE_LASER_HUE_LOW1  = 0      # red lower range
+EE_LASER_HUE_HIGH1 = 10
+EE_LASER_HUE_LOW2  = 130    # magenta/pink: 650nm laser on D455 appears H≈150-165
+EE_LASER_HUE_HIGH2 = 180
+EE_LASER_SAT_MIN        = 10     # laser pixels have S=14-48 (near-white pink core)
+EE_LASER_VAL_MIN        = 230    # only near-saturated pixels: cuts ambient surfaces
+EE_LASER_CORE_VAL_MIN   = 180    # overexposed white core: any hue, very bright
+EE_LASER_CORE_SAT_MAX   = 80     # white core has near-zero saturation
+EE_LASER_MIN_AREA  = 1
+EE_LASER_MAX_AREA  = 100
+EE_LASER_MAX_JUMP_PX   = 999   # disabled — ROI search handles rejection instead
+EE_LASER_SMOOTH_FRAMES = 5     # 5-frame median
+EE_LASER_ROI_PX        = 35    # search radius around last position (px)
 DRAW_EE_MARKER         = True
 # Shift the overlay box in the camera stream without affecting 3D detection.
 # Positive X_OFFSET_MM moves box right in robot base frame (→ left in image).
@@ -277,9 +292,9 @@ CAMERA_DIRECT_MATRIX = (
 CAM_FINE_ROLL_DEG  = 0.0
 CAM_FINE_PITCH_DEG = 0.0
 CAM_FINE_YAW_DEG   = 0.0
-CAM_TX_MM =  -5.0   # tuning — adjust in ±10mm steps until green box centres under arm
-CAM_TY_MM = +305.0   # calibrated: +57mm correction for 45px vertical gap at Z_cam≈762mm, fy≈600
-CAM_TZ_MM =  352.0   # measured: z_cam ≈ 732 mm to surface at pick_z ≈ -380 mm
+CAM_TX_MM =  -15.0   # tuning — adjust in ±10mm steps until green box centres under arm
+CAM_TY_MM = 245.0    # calculated: EE dot at y=38px (exit Y=-150mm) → crosshair at 161px → T_Y=96≈100mm
+CAM_TZ_MM =  -20.0   # measured: camera is 20 mm below base frame origin
 
 # Full 4×4 homogeneous T_cam_to_base  (p_base = T @ [p_cam; 1])
 # Built from the R and t above — use camera_system._build_T_cam_to_base() at runtime
@@ -292,14 +307,14 @@ CAMERA_T_BASE = (
 
 X_LIMIT = 150.0   # rectangular pre-filter; IK in check_workspace rejects unreachable corners
 Y_LIMIT = 150.0
-Z_MIN = -500.0
+Z_MIN = -510.0
 # Actual IK ceiling at centre: -sqrt(re^2 - (rf + (f-e)*tan30/2)^2) ≈ -323.5 mm.
 # The old value (-196.875) was geometrically wrong; any Z above -323 fails IK.
 Z_MAX = -323.0
 
-THETA1_MIN = 0.0
+THETA1_MIN = -5
 THETA1_MAX = 67   # physical hard stop observed at ~56° — use 54° with 2° margin
-THETA2_MIN = 0.0
+THETA2_MIN = -5
 THETA2_MAX = 67.0
-THETA3_MIN = 0.0
+THETA3_MIN = -5
 THETA3_MAX = 67.0

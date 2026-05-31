@@ -86,6 +86,10 @@ class DeltaCamera(Node):
         self._pub_ee_pos      = self.create_publisher(PointStamped, "/delta/ee_position_mm",       10)
         self._pub_ee_error    = self.create_publisher(PointStamped, "/delta/ee_error_mm",          10)
         self.create_service(Trigger, "/delta/calibrate_cam_offset", self._calibrate_offset_srv)
+        self._ee_fk_pixel = None
+        self.create_subscription(
+            PointStamped, "/delta/ee_fk_xyz", self._ee_fk_callback, 10
+        )
 
         mode = "FAKE DEPTH" if config.FAKE_DEPTH_ENABLE else "REAL DEPTH"
         self.get_logger().info(
@@ -100,6 +104,11 @@ class DeltaCamera(Node):
 
         self.reset_tracking_state()
         self._validate_config()
+
+    def _ee_fk_callback(self, msg: PointStamped):
+        px = self._project_base_to_pixel(msg.point.x, msg.point.y, msg.point.z)
+        if px is not None:
+            self._ee_fk_pixel = px
 
     def info_callback(self, msg: CameraInfo):
         self.fx = msg.k[0]
@@ -172,7 +181,11 @@ class DeltaCamera(Node):
         # ── EE marker detection ───────────────────────────────────────────────
         ee_pixel = None
         ee_base_xy = None
-        ee_uv = self.detect_ee_marker(frame)
+        ee_uv = self.detect_ee_marker(
+            frame,
+            ws_corners=getattr(self, '_ws_poly', None),
+            exclude_bbox=getattr(self, '_last_obj_bbox', None),
+        )
         if ee_uv is not None:
             eu, ev = ee_uv
             ee_z_m = None
@@ -269,7 +282,9 @@ class DeltaCamera(Node):
             track_confirmed = self.update_detection_confirmation(track_id)
 
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.circle(annotated, (u, v), 5, (0, 0, 255), -1)
+            cv2.line(annotated, (u - 8, v), (u + 8, v), (0, 255, 0), 1)
+            cv2.line(annotated, (u, v - 8), (u, v + 8), (0, 255, 0), 1)
+            cv2.circle(annotated, (u, v), 4, (0, 255, 0), 1)
             if center_contour is not None and config.DRAW_DETECTION_CONTOUR:
                 cv2.drawContours(annotated, [center_contour], -1, (255, 255, 0), 2)
             if corners_uv is not None and config.DRAW_DETECTION_CORNERS:
@@ -310,6 +325,8 @@ class DeltaCamera(Node):
                     )
                     continue
 
+            print(f"DETECT: conf={conf:.2f} pixel=({u},{v}) depth={z_m}")
+
             xyz_cam = self.pixel_to_camera_xyz_mm(u, v, z_m)
             if xyz_cam is None:
                 continue
@@ -335,17 +352,25 @@ class DeltaCamera(Node):
 
             workspace_xyz = xyz_avg if xyz_avg is not None else (x_base_now, y_base_now, z_base_now)
             wx, wy, wz = workspace_xyz
-            in_workspace = self.check_workspace(wx, wy, wz)
+            # IK operates on the platform (motor plate), not the EE tip.
+            # Convert EE-tip Z to platform Z before any workspace/IK check.
+            wz_platform = wz - config.EE_OFFSET_Z_MM
+            in_workspace = self.check_workspace(wx, wy, wz_platform)
             # In conveyor mode, also allow objects in the approach zone (y > Y_LIMIT)
             # so the robot can pre-position while the object is still incoming.
             in_approach_zone = (
                 config.CONVEYOR_MODE
                 and abs(wx) <= config.X_LIMIT
                 and wy > config.Y_LIMIT
-                and config.Z_MIN <= wz <= config.Z_MAX
+                and config.Z_MIN <= wz_platform <= config.Z_MAX
                 and len(self._timed_xyz_bufs.get(track_id, [])) >= 3
             )
             if config.DETECT_ONLY_IN_WORKSPACE and not in_workspace and not in_approach_zone:
+                self.get_logger().warn(
+                    f"REJECT OUTSIDE_WORKSPACE: ee_tip=({wx:.1f},{wy:.1f},{wz:.1f}) "
+                    f"platform_z={wz_platform:.1f} "
+                    f"limits=X±{config.X_LIMIT} Y±{config.Y_LIMIT} Z[{config.Z_MIN},{config.Z_MAX}]"
+                )
                 if config.DRAW_REJECTED_DETECTIONS:
                     self.draw_rejected_detection(
                         annotated,
@@ -378,6 +403,9 @@ class DeltaCamera(Node):
                         reason = "CONVEYOR_OK" if in_workspace else "APPROACH_ZONE"
                     elif not self.is_stable(xyz_avg):
                         reason = "NOT_STABLE"
+                        self.get_logger().warn(
+                            f"REJECT NOT_STABLE: xyz=({x_use:.1f},{y_use:.1f},{z_use:.1f})"
+                        )
                     elif config.VISION_ONLY_ENABLE:
                         allowed = True
                         reason = "OK"
@@ -385,6 +413,11 @@ class DeltaCamera(Node):
                         ik_deg, fk_xyz, fk_err, allowed, reason = self.validate_target(
                             x_use, y_use, z_use
                         )
+                        if not allowed:
+                            self.get_logger().warn(
+                                f"REJECT validate_target: reason={reason} "
+                                f"xyz=({x_use:.1f},{y_use:.1f},{z_use:.1f})"
+                            )
 
             theta_text = ""
             if ik_deg is not None:
@@ -538,37 +571,66 @@ class DeltaCamera(Node):
                 p.position.y = c["y_base"] / 1000.0
                 p.position.z = c["z_base"] / 1000.0
                 pa.poses.append(p)
+            self.get_logger().info(f"PUBLISHING all_targets: {len(pa.poses)} poses")
             self._pub_all_targets.publish(pa)
 
         # ── EE vs object error display ────────────────────────────────────────
-        if (ee_pixel is not None and best is not None
+        # Multi-object fix: when FK pixel is known (robot hovering at approach),
+        # pick the detection closest to the FK pixel — not the globally best one.
+        fk_px = getattr(self, '_ee_fk_pixel', None)
+        if fk_px is not None and all_candidates:
+            error_det = min(
+                all_candidates,
+                key=lambda c: (c["u"] - fk_px[0])**2 + (c["v"] - fk_px[1])**2
+            )
+        else:
+            error_det = best
+
+        if (ee_pixel is not None and error_det is not None
                 and self.fx is not None and self.fy is not None):
             ex, ey = ee_pixel
-            ox, oy = best["u"], best["v"]
+            ox, oy = error_det["u"], error_det["v"]
+            if not hasattr(self, '_ee_err_buf'):
+                self._ee_err_buf = deque(maxlen=10)
+            if self._ee_err_buf:
+                last_ox = sum(e[0] for e in self._ee_err_buf) / len(self._ee_err_buf)
+                last_oy = sum(e[1] for e in self._ee_err_buf) / len(self._ee_err_buf)
+                if ((ox - ex - last_ox)**2 + (oy - ey - last_oy)**2) > 900:
+                    self._ee_err_buf.clear()
             du = ox - ex
             dv = oy - ey
             z_cam_mm = config.FAKE_DEPTH_M * 1000.0
             dx_mm = du * z_cam_mm / self.fx
             dy_mm = dv * z_cam_mm / self.fy
+            self._ee_err_buf.append((dx_mm, dy_mm))
+            dx_smooth = sum(e[0] for e in self._ee_err_buf) / len(self._ee_err_buf)
+            dy_smooth = sum(e[1] for e in self._ee_err_buf) / len(self._ee_err_buf)
+
             cv2.line(annotated, (ex, ey), (ox, oy), (0, 255, 255), 1)
             mx, my = (ex + ox) // 2, (ey + oy) // 2
-            cv2.putText(annotated, f"err {dx_mm:+.0f},{dy_mm:+.0f}mm",
+            cv2.putText(annotated, f"err {dx_smooth:+.0f},{dy_smooth:+.0f}mm",
                         (mx + 4, my), cv2.FONT_HERSHEY_SIMPLEX,
                         0.25, (0, 255, 255), 1)
             err_pt = PointStamped()
             err_pt.header.stamp = self.get_clock().now().to_msg()
             err_pt.header.frame_id = "robot_base"
-            err_pt.point.x = dx_mm
-            err_pt.point.y = dy_mm
+            err_pt.point.x = dx_smooth
+            err_pt.point.y = dy_smooth
             err_pt.point.z = 0.0
             self._pub_ee_error.publish(err_pt)
             self._ee_err_frame = getattr(self, "_ee_err_frame", 0) + 1
             if self._ee_err_frame % 10 == 0:
                 self.get_logger().info(
-                    f"EE vs obj: dx={dx_mm:+.1f} dy={dy_mm:+.1f} mm  "
+                    f"EE vs obj: dx={dx_smooth:+.1f} dy={dy_smooth:+.1f} mm  "
                     f"(du={du} dv={dv} px)"
                 )
 
+        if best is not None:
+            pad = 10
+            self._last_obj_bbox = (
+                best["x1"] - pad, best["y1"] - pad,
+                best["x2"] + pad, best["y2"] + pad,
+            )
         return annotated, best
 
     def generate_detections(self, frame, depth_image=None):
@@ -1401,6 +1463,16 @@ class DeltaCamera(Node):
             cx = int(M["m10"] / M["m00"]) + rx1
             cy = int(M["m01"] / M["m00"]) + ry1
 
+            ws_poly = getattr(self, '_ws_poly', None)
+            if ws_poly is not None:
+                pts = ws_poly.reshape(-1, 2)
+                x_min = int(pts[:, 0].min())
+                x_max = int(pts[:, 0].max())
+                y_min = int(pts[:, 1].min())
+                y_max = int(pts[:, 1].max())
+                if not (x_min <= cx <= x_max and y_min <= cy <= y_max):
+                    continue
+
             full_contour = contour + np.array([[[rx1, ry1]]], dtype=np.int32)
             x1 = x + rx1
             y1 = y + ry1
@@ -2205,100 +2277,127 @@ class DeltaCamera(Node):
             "size_source": size_source,
         }
 
-    def detect_ee_marker(self, frame):
-        """Detect white laser dot on EE tip. Returns (u, v) centroid or None.
+    def detect_ee_marker(self, frame, ws_corners=None, exclude_bbox=None):
+        """Detect 650nm laser dot. Returns (u, v) centroid or None.
 
-        Must be called with the RAW frame.
-        White in HSV: any hue, S < sat_max, V > val_min.
-        Among size-passing blobs the brightest is selected.
-        Blobs within ±8px of the workspace crosshair are excluded.
+        Uses ROI-based search: once the dot is found, only searches within
+        EE_LASER_ROI_PX pixels of the last known position. This prevents the
+        laser reflection off the object surface (20-50px away due to parallax)
+        from being mistaken for the EE tip.
         """
-        # ── DEBUG: widened thresholds + console logging for first 100 calls ──
-        self._ee_debug_count = getattr(self, '_ee_debug_count', 0) + 1
-        debug_active = self._ee_debug_count <= 100
-        do_print     = debug_active and (self._ee_debug_count % 30 == 1)
-
-        if debug_active:
-            sat_max  = 80    # widened (config: EE_LASER_SAT_MAX=50)
-            val_min  = 180   # widened (config: EE_LASER_VAL_MIN=210)
-            max_area = 500   # widened (config: EE_LASER_MAX_AREA=300)
-        else:
-            sat_max  = int(config.EE_LASER_SAT_MAX)
-            val_min  = int(config.EE_LASER_VAL_MIN)
-            max_area = int(config.EE_LASER_MAX_AREA)
-        # ─────────────────────────────────────────────────────────────────────
+        if not hasattr(self, '_ee_history'):
+            self._ee_history = deque(maxlen=config.EE_LASER_SMOOTH_FRAMES)
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, (0, 0, val_min), (180, sat_max, 255))
+        fh, fw = hsv.shape[:2]
 
-        open_k  = 3
-        close_k = 5
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((open_k,  open_k),  np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
+        sat_min  = int(config.EE_LASER_SAT_MIN)
+        val_min  = int(config.EE_LASER_VAL_MIN)
+        max_area = int(config.EE_LASER_MAX_AREA)
+        roi_r    = int(getattr(config, 'EE_LASER_ROI_PX', 35))
 
-        # Exclude ±8px around the workspace-centre crosshair (also white)
-        crosshair_px = None
-        if self.fx is not None:
-            ox = getattr(config, 'WORKSPACE_OVERLAY_X_OFFSET_MM', 0.0)
-            oy = getattr(config, 'WORKSPACE_OVERLAY_Y_OFFSET_MM', 0.0)
-            crosshair_px = self._project_base_to_pixel(ox, oy, config.WORKSPACE_PICK_Z_MM)
-        if crosshair_px is not None:
-            ccx, ccy = int(crosshair_px[0]), int(crosshair_px[1])
-            mh, mw = mask.shape[:2]
-            mask[max(0, ccy - 8):min(mh, ccy + 9),
-                 max(0, ccx - 8):min(mw, ccx + 9)] = 0
+        mask1 = cv2.inRange(hsv,
+            (config.EE_LASER_HUE_LOW1, sat_min, val_min),
+            (config.EE_LASER_HUE_HIGH1, 255, 255))
+        mask2 = cv2.inRange(hsv,
+            (config.EE_LASER_HUE_LOW2, sat_min, val_min),
+            (config.EE_LASER_HUE_HIGH2, 255, 255))
+        mask_red  = cv2.bitwise_or(mask1, mask2)
+        mask_core = cv2.inRange(hsv,
+            (0, 0, int(config.EE_LASER_CORE_VAL_MIN)),
+            (180, int(config.EE_LASER_CORE_SAT_MAX), 255))
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        v_chan = hsv[:, :, 2]
-        best = None
-        best_brightness = 0.0
-        tmp_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        debug_areas = []
-        for c in contours:
-            area = float(cv2.contourArea(c))
-            passed = config.EE_LASER_MIN_AREA <= area <= max_area
-            if do_print:
-                debug_areas.append(f"{area:.0f}({'ok' if passed else 'skip'})")
-            if not passed:
-                continue
-            tmp_mask[:] = 0
-            cv2.drawContours(tmp_mask, [c], -1, 255, cv2.FILLED)
-            mean_v = float(cv2.mean(v_chan, mask=tmp_mask)[0])
-            if mean_v > best_brightness:
-                best_brightness = mean_v
-                best = c
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask_red  = cv2.morphologyEx(mask_red,  cv2.MORPH_CLOSE, k)
+        mask_core = cv2.morphologyEx(mask_core, cv2.MORPH_CLOSE, k)
 
-        # ── raw centroid from brightest passing blob ───────────────────────────
+        last_pos = self._ee_history[-1] if self._ee_history else None
+        if last_pos is not None:
+            lx, ly = last_pos
+            roi_mask = np.zeros((fh, fw), dtype=np.uint8)
+            x1r = max(0, lx - roi_r); x2r = min(fw, lx + roi_r)
+            y1r = max(0, ly - roi_r); y2r = min(fh, ly + roi_r)
+            roi_mask[y1r:y2r, x1r:x2r] = 255
+            search_red  = cv2.bitwise_and(mask_red,  roi_mask)
+            search_core = cv2.bitwise_and(mask_core, roi_mask)
+        else:
+            search_red  = mask_red
+            search_core = mask_core
+
+        ws_xs = ws_ys = None
+        if ws_corners is not None:
+            ws_xs = [p[0] for p in ws_corners]
+            ws_ys = [p[1] for p in ws_corners]
+
+        v_chan   = hsv[:, :, 2]
+        tmp_mask = np.zeros((fh, fw), dtype=np.uint8)
+
+        def _pick(mask):
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            best_c, best_score = None, -1.0
+            for c in contours:
+                area = float(cv2.contourArea(c))
+                if not (config.EE_LASER_MIN_AREA <= area <= max_area):
+                    continue
+
+                # Shape classification: laser dot is circular and compact
+                perimeter = cv2.arcLength(c, True)
+                if perimeter < 1.0:
+                    continue
+                circularity = (4.0 * math.pi * area) / (perimeter * perimeter)
+                if circularity < 0.35:   # elongated or irregular — not a laser dot
+                    continue
+                (_, _), (bw, bh), _ = cv2.minAreaRect(c)
+                if bw > 0 and bh > 0:
+                    aspect = max(bw, bh) / min(bw, bh)
+                    if aspect > 2.5:     # too elongated — reflection artifact
+                        continue
+
+                M_c = cv2.moments(c)
+                if M_c["m00"] == 0:
+                    continue
+                cx = int(M_c["m10"] / M_c["m00"])
+                cy = int(M_c["m01"] / M_c["m00"])
+                if ws_xs is not None:
+                    if not (min(ws_xs) <= cx <= max(ws_xs) and
+                            min(ws_ys) <= cy <= max(ws_ys)):
+                        continue
+
+                tmp_mask[:] = 0
+                cv2.drawContours(tmp_mask, [c], -1, 255, cv2.FILLED)
+                mean_v = float(cv2.mean(v_chan, mask=tmp_mask)[0])
+
+                # Score = brightness × circularity — rewards compact bright dots
+                score = mean_v * circularity
+                if score > best_score:
+                    best_score = score
+                    best_c = c
+            return best_c
+
+        best = _pick(search_red)
+        if best is None:
+            best = _pick(search_core)
+        if best is None and last_pos is not None:
+            best = _pick(mask_red)
+        if best is None and last_pos is not None:
+            best = _pick(mask_core)
+
         raw = None
         if best is not None:
             M = cv2.moments(best)
             if M["m00"] != 0:
                 raw = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
 
-        # ── workspace bounds filter (±20px around ws_poly bounding box) ───────
-        if raw is not None:
-            ws_poly = getattr(self, '_ws_poly', None)
-            if ws_poly is not None:
-                pts = ws_poly.reshape(-1, 2)
-                x_min = int(pts[:, 0].min()) - 20
-                x_max = int(pts[:, 0].max()) + 20
-                y_min = int(pts[:, 1].min()) - 20
-                y_max = int(pts[:, 1].max()) + 20
-                if not (x_min < raw[0] < x_max and y_min < raw[1] < y_max):
-                    raw = None
-
-        # ── temporal smoothing: jump filter + median over last N frames ────────
         if not hasattr(self, '_ee_history'):
             self._ee_history = deque(maxlen=config.EE_LASER_SMOOTH_FRAMES)
 
         result = None
         if raw is not None:
-            # Jump filter: reject if too far from last accepted position
             if self._ee_history:
                 lx, ly = self._ee_history[-1]
                 jump = ((raw[0] - lx) ** 2 + (raw[1] - ly) ** 2) ** 0.5
                 if jump > config.EE_LASER_MAX_JUMP_PX:
-                    raw = None   # noise spike — discard
+                    raw = None
 
         if raw is not None:
             self._ee_history.append(raw)
@@ -2308,13 +2407,6 @@ class DeltaCamera(Node):
             ys = sorted(p[1] for p in self._ee_history)
             n  = len(xs)
             result = (xs[n // 2], ys[n // 2])
-
-        if do_print:
-            xhair = (f"({int(crosshair_px[0])},{int(crosshair_px[1])})"
-                     if crosshair_px is not None else "None")
-            print(f"[EE debug #{self._ee_debug_count}]  "
-                  f"{len(contours)} contours  areas={debug_areas}  "
-                  f"crosshair_excl={xhair}  raw={raw}  result={result}")
 
         return result
 
@@ -2645,10 +2737,12 @@ class DeltaCamera(Node):
         return fk_check_workspace(x, y, z)
 
     def validate_target(self, x_base, y_base, z_base):
-        if not self.check_workspace(x_base, y_base, z_base):
+        # z_base is EE-tip Z; convert to platform Z for IK (motor_controller does the same).
+        z_platform = z_base - config.EE_OFFSET_Z_MM
+        if not self.check_workspace(x_base, y_base, z_platform):
             return None, None, None, False, "OUTSIDE_WORKSPACE"
 
-        st_ik, t1, t2, t3 = delta_calcInverse(x_base, y_base, z_base, e, f, re, rf)
+        st_ik, t1, t2, t3 = delta_calcInverse(x_base, y_base, z_platform, e, f, re, rf)
         if st_ik != 0:
             return None, None, None, False, "IK_FAILED"
 
@@ -2667,7 +2761,7 @@ class DeltaCamera(Node):
         fk_err = math.sqrt(
             (x_base - x_fk) ** 2
             + (y_base - y_fk) ** 2
-            + (z_base - z_fk) ** 2
+            + (z_platform - z_fk) ** 2
         )
 
         if fk_err > config.FK_VERIFY_TOL_MM:

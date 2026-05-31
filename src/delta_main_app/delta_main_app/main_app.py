@@ -36,6 +36,7 @@ from delta_common import config
 from delta_common import error_map
 from delta_common.fk_ik import check_workspace, delta_calcInverse, e, f, re, rf
 from delta_motor_controller.motor_controller import DeltaMotorController
+from delta_motor_controller.pneumatic_gripper import PneumaticGripper
 from delta_main_app.belt_predictor import BeltPredictor
 
 # -- Pick-and-place geometry (mm, robot base frame) --------------------
@@ -43,7 +44,7 @@ from delta_main_app.belt_predictor import BeltPredictor
 # i.e. between -500.0 and -196.875 mm.
 # The helpers _approach_z() and _lift_z() clamp automatically.
 
-APPROACH_Z_OFFSET = 25.0
+APPROACH_Z_OFFSET = 0.0
 LIFT_Z_OFFSET = 30.0
 HOME_X = 0.0
 HOME_Y = 0.0
@@ -145,12 +146,15 @@ class PickAndPlaceStateMachine:
         Returns False if the robot is currently busy."""
         az = _approach_z(z)
         lz = _lift_z(z)
-        for cx, cy, cz, label in (
+        ee_off = config.EE_OFFSET_Z_MM
+        for cx, cy, cz_ee, label in (
             (x,   y,   az,    "approach"),
             (x,   y,   z,     "pick"),
             (x,   y,   lz,    "lift"),
             (0.0, 0.0, -350.0, "home"),
         ):
+            # home uses raw platform Z; others are EE-tip Z that need offset conversion
+            cz = cz_ee if label == "home" else cz_ee - ee_off
             st, t1, t2, t3 = delta_calcInverse(cx, cy, cz, e, f, re, rf)
             if st == 0:
                 self._log.info(
@@ -211,17 +215,30 @@ class PickAndPlaceStateMachine:
             return self._ee_error_x, self._ee_error_y
 
     def _wait_fresh_ee_error(self, timeout=1.0):
-        """Invalidate stored error then block until a fresh sample arrives."""
-        with self._lock:
-            self._ee_error_x = None
-            self._ee_error_y = None
-        t = time.time()
-        while time.time() - t < timeout:
-            time.sleep(0.05)
+        """Collect 5 fresh error samples and return their median.
+
+        One bad frame from a shiny reflection can't drive a correction by itself.
+        """
+        deadline = time.time() + timeout
+        samples_x, samples_y = [], []
+        while time.time() < deadline and len(samples_x) < 3:
             with self._lock:
-                if self._ee_error_x is not None:
-                    return self._ee_error_x, self._ee_error_y
-        return None, None
+                self._ee_error_x = None
+                self._ee_error_y = None
+            t_s = time.time()
+            while time.time() - t_s < 0.15:
+                time.sleep(0.02)
+                with self._lock:
+                    if self._ee_error_x is not None:
+                        samples_x.append(self._ee_error_x)
+                        samples_y.append(self._ee_error_y)
+                        break
+        if not samples_x:
+            return None, None
+        samples_x.sort()
+        samples_y.sort()
+        n = len(samples_x)
+        return samples_x[n // 2], samples_y[n // 2]
 
     def _start_sequence(self) -> None:
         self._busy = True
@@ -231,25 +248,21 @@ class PickAndPlaceStateMachine:
         from delta_common.fk_ik import delta_calcInverse, e, f, re, rf
 
         x, y, z = self._target_xyz
+        z_platform = z - config.EE_OFFSET_Z_MM   # EE-tip → platform Z for all moves
+        az = _approach_z(z_platform)
+        lz = _lift_z(z_platform)
 
-        az = _approach_z(z)
-        lz = _lift_z(z)
-
-        # At offset XY positions, the shallow approach Z may be outside the
-        # reachable workspace (delta workspace shrinks near the ceiling).
-        # If approach has no IK solution, skip it and go straight to pick depth.
         st_az, *_ = delta_calcInverse(x, y, az, e, f, re, rf)
         use_approach = (st_az == 0)
         if not use_approach:
             self._log.warn(
                 f"Approach Z={az:.1f} unreachable at XY=({x:.1f},{y:.1f}) "
-                f"— skipping approach, descending directly to Z={z:.1f}"
+                f"— skipping approach, descending directly to Z={z_platform:.1f} (ee_tip={z:.1f})"
             )
 
-        if lz != z + LIFT_Z_OFFSET:
+        if lz != z_platform + LIFT_Z_OFFSET:
             self._log.warn(
-                f"Lift Z clamped: {z + LIFT_Z_OFFSET:.1f} -> {lz:.1f} mm "
-                f"(Z_MAX={config.Z_MAX:.1f})"
+                f"Lift Z clamped: {z_platform + LIFT_Z_OFFSET:.1f} -> {lz:.1f} mm"
             )
 
         try:
@@ -262,36 +275,62 @@ class PickAndPlaceStateMachine:
                     time.sleep(config.CONVEYOR_APPROACH_WAIT_SEC)
 
                 if config.EE_CORRECTION_ENABLE:
-                    self._ctrl.set_speed_mode(config.EE_CORRECTION_SPEED_MODE)
                     t_start = time.time()
+                    self._log.info(
+                        f"EE correction start  "
+                        f"max={config.EE_CORRECTION_MAX_ITERS}  "
+                        f"thresh={config.EE_CORRECTION_THRESH_MM}mm"
+                    )
                     for i in range(config.EE_CORRECTION_MAX_ITERS):
-                        self._move(x, y, az)
-                        err_x, err_y = self._wait_fresh_ee_error(timeout=0.8)
+
+                        err_x, err_y = self._wait_fresh_ee_error(
+                            timeout=config.EE_CORRECTION_WAIT_S
+                        )
+
                         if err_x is None:
-                            self._log.warn("No fresh EE error — skip correction")
+                            self._log.warn(f"Iter {i}: no EE error — stop")
                             break
-                        x_dist = abs(err_x)
+
+                        dist_2d = math.sqrt(err_x**2 + err_y**2)
                         self._log.info(
                             f"Correction iter {i}: "
-                            f"err_x={err_x:+.1f}mm x_dist={x_dist:.1f}mm"
+                            f"err_x={err_x:+.1f}mm err_y={err_y:+.1f}mm "
+                            f"dist_2d={dist_2d:.1f}mm"
                         )
-                        if x_dist < config.EE_CORRECTION_THRESH_MM:
-                            self._log.info("X converged")
+
+                        if dist_2d < config.EE_CORRECTION_MIN_MM:
+                            self._log.info("Below MIN — done")
                             break
+
+                        if dist_2d < config.EE_CORRECTION_THRESH_MM:
+                            self._log.info("Converged")
+                            break
+
                         if time.time() - t_start > config.EE_CORRECTION_TIMEOUT_S:
-                            self._log.warn("Timeout — proceeding")
+                            self._log.warn("Correction timeout — proceeding")
                             break
-                        x_new = x - err_x
-                        if abs(x_new) > config.X_LIMIT:
-                            self._log.warn("X out of workspace — skip")
-                            break
+
+                        x_new = x - err_x * config.EE_CORRECTION_GAIN
+                        y_new = y + err_y * config.EE_CORRECTION_GAIN
+
+                        # Clamp to workspace instead of stopping
+                        x_new = max(-config.X_LIMIT + 5.0,
+                                min( config.X_LIMIT - 5.0, x_new))
+                        y_new = max(-config.Y_LIMIT + 5.0,
+                                min( config.Y_LIMIT - 5.0, y_new))
+
                         x = x_new
-                    self._ctrl.set_speed_mode(config.EE_PICK_SPEED_MODE)
-                    self._move(x, y, az)
+                        y = y_new
+                        self._log.info(
+                            f"  → move X={x:.1f}mm Y={y:.1f}mm"
+                        )
+                        self._move(x, y, az)
+
                     time.sleep(0.1)
 
             self._set_state("PICKING")
-            if not self._move(x, y, z):
+            pick_z = _clamp_z(z_platform + config.PICK_Z_EXTRA_MM)
+            if not self._move(x, y, pick_z):
                 raise RuntimeError("PICK descend failed")
             time.sleep(MOVE_SETTLE_SEC)
 
@@ -308,7 +347,8 @@ class PickAndPlaceStateMachine:
             time.sleep(MOVE_SETTLE_SEC)
 
             self._set_state("TRANSPORTING")
-            if not self._move(config.PLACE_X, config.PLACE_Y, config.PLACE_Z):
+            place_z = _clamp_z(config.PLACE_Z + config.PLACE_Z_EXTRA_MM)
+            if not self._move(config.PLACE_X, config.PLACE_Y, place_z):
                 raise RuntimeError("TRANSPORT failed")
             time.sleep(MOVE_SETTLE_SEC)
 
@@ -323,7 +363,6 @@ class PickAndPlaceStateMachine:
         finally:
             self._set_state("RESETTING")
             self._move(HOME_X, HOME_Y, HOME_Z, raw=True)
-
             with self._lock:
                 self._state = "IDLE"
                 self._busy = False
@@ -350,9 +389,10 @@ class PickAndPlaceStateMachine:
             f"  Move ({x:.1f}, {y:.1f}, {z:.1f})  "
             f"theta=({t1:.1f}, {t2:.1f}, {t3:.1f})"
         )
-        ok, ik_deg, fb_deg, fk_xyz, err = self._ctrl.move_xyz(x, y, z, raw=raw)
+        ok, _, _, _, err = self._ctrl.move_xyz(x, y, z, raw=raw)
         if ok:
             self._log.info(f"  FK err={err:.2f} mm  OK")
+            self._current_ee_xyz = (x, y, z + config.EE_OFFSET_Z_MM)
         else:
             self._log.warn("  Move FAILED")
         return ok
@@ -374,7 +414,11 @@ class DeltaMainApp(Node):
     def __init__(self):
         super().__init__("delta_main_app")
 
-        self._ctrl = DeltaMotorController(can_port="can0")
+        self._ctrl = DeltaMotorController(
+            can_port="can0",
+            vel_max=config.MOTOR_VEL_MAX,
+            acc_set=config.MOTOR_ACC_SET,
+        )
         if config.ENABLE_MOTORS:
             self._ctrl.connect()
             self.get_logger().info("Motors connected.")
@@ -383,6 +427,11 @@ class DeltaMainApp(Node):
 
         self._gripper_pub = self.create_publisher(Float32, "/delta/gripper_cmd", 10)
         self._state_pub = self.create_publisher(String, "/delta/robot_state", 10)
+
+        self._gripper = PneumaticGripper(can_channel='can0', can_id=4)
+        if config.ENABLE_MOTORS:
+            self._gripper.connect()
+            self.get_logger().info("Gripper connected (direct CAN).")
 
         self._fsm = PickAndPlaceStateMachine(
             controller=self._ctrl,
@@ -412,13 +461,29 @@ class DeltaMainApp(Node):
         self._sub_ee_error = self.create_subscription(
             PointStamped, "/delta/ee_error_mm", self._ee_error_callback, 10
         )
+        self._pub_ee_fk = self.create_publisher(PointStamped, "/delta/ee_fk_xyz", 10)
+        self._fsm._current_ee_xyz = None
         self.create_timer(0.1, self._queue_timer)
+        self.create_timer(0.05, self._publish_ee_fk_timer)
 
         self.get_logger().info(
             f"DeltaMainApp ready  "
             f"Z_workspace=[{config.Z_MIN:.0f}, {config.Z_MAX:.0f}] mm  "
             f"place=({config.PLACE_X:.0f}, {config.PLACE_Y:.0f}, {config.PLACE_Z:.0f}) mm"
         )
+        self.get_logger().info("main_app node started, waiting for detections...")
+
+    def _publish_ee_fk_timer(self) -> None:
+        xyz = self._fsm._current_ee_xyz
+        if xyz is None:
+            return
+        pt = PointStamped()
+        pt.header.stamp = self.get_clock().now().to_msg()
+        pt.header.frame_id = "robot_base"
+        pt.point.x = float(xyz[0])
+        pt.point.y = float(xyz[1])
+        pt.point.z = float(xyz[2])
+        self._pub_ee_fk.publish(pt)
 
     def _ee_error_callback(self, msg: PointStamped) -> None:
         alpha = config.EE_CORRECTION_ALPHA
@@ -433,7 +498,13 @@ class DeltaMainApp(Node):
         )
 
     def _all_targets_callback(self, msg: PoseArray) -> None:
+        self.get_logger().info(f"GOT all_targets: {len(msg.poses)} poses")
         with self._queue_lock:
+            self.get_logger().info(
+                f"ALL_TARGETS: {len(msg.poses)} poses, "
+                f"fsm={self._fsm.state}, "
+                f"queue={len(self._target_queue)}"
+            )
             candidates = [
                 (p.position.x * 1000.0, p.position.y * 1000.0, p.position.z * 1000.0)
                 for p in msg.poses
@@ -454,6 +525,13 @@ class DeltaMainApp(Node):
 
     def _queue_timer(self) -> None:
         with self._queue_lock:
+            if self._fsm.state == "IDLE" and self._target_queue:
+                self.get_logger().info(
+                    f"QUEUE_TIMER: processing target "
+                    f"({self._target_queue[0][0]:.1f}, "
+                    f"{self._target_queue[0][1]:.1f}, "
+                    f"{self._target_queue[0][2]:.1f})"
+                )
             if self._fsm.state != "IDLE" or not self._target_queue:
                 return
             x, y, z = self._target_queue.pop(0)
@@ -465,7 +543,7 @@ class DeltaMainApp(Node):
                     f"or insufficient belt data — skipped"
                 )
                 return
-            if not check_workspace(x, result.y_pick, z):
+            if not check_workspace(x, result.y_pick, z - config.EE_OFFSET_Z_MM):
                 self.get_logger().warn(
                     f"Predicted pick ({x:.1f}, {result.y_pick:.1f}, {z:.1f}) outside workspace — skipped"
                 )
@@ -495,6 +573,11 @@ class DeltaMainApp(Node):
         m = Float32()
         m.data = float(pos)
         self._gripper_pub.publish(m)
+        if config.ENABLE_MOTORS:
+            if pos > 0.5:
+                self._gripper.grip(wait=False)
+            else:
+                self._gripper.release(wait=False)
 
     def _send_state(self, state: str) -> None:
         m = String()
@@ -560,7 +643,7 @@ def main(args=None):
     rclpy.init(args=args)
     node = DeltaMainApp()
 
-    def handle_sigint(sig, frame):
+    def handle_sigint(*_):
         node.get_logger().info("Ctrl+C received — shutting down cleanly")
         node.destroy_node()
         rclpy.shutdown()
