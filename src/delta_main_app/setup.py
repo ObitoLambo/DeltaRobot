@@ -13,6 +13,7 @@ setup(
         ('share/' + package_name + '/launch', [
             'launch/delta_main.launch.py',
             'launch/blind_pick_place.launch.py',
+            'launch/matlab_bridge.launch.py',
         ]),
     ],
     install_requires=['setuptools'],
