@@ -60,25 +60,19 @@ source install/setup.bash
 
 ## Run
 
-### Step 1 — Start the camera and detection pipeline
+### Option A — Launch file (recommended)
+
+One command starts the RealSense camera, the camera system, and the bridge node
+together:
 
 ```bash
-# Terminal 1: RealSense camera + camera_system node
-ros2 launch delta_main_app delta_main.launch.py
-```
-
-> The launch file starts the realsense2_camera node and delta_camera_system.
-> The camera system publishes confirmed detections to `/delta/target_xyz`.
-
-### Step 2 — Start the MATLAB bridge node
-
-```bash
-# Terminal 2
 source ~/delta_ws/install/setup.bash
-ros2 run delta_main_app matlab_bridge
+ros2 launch delta_main_app matlab_bridge.launch.py
 ```
 
-You should see:
+All three nodes print to the same terminal.  You should see the bridge announce
+itself last:
+
 ```
 [matlab_bridge_node]: MatlabBridgeNode ready
   Listening : /delta/target_xyz
@@ -88,7 +82,49 @@ You should see:
   MATLAB timeout: 3.0 s
 ```
 
-### Step 3 — Connect MATLAB
+#### Override camera settings at launch time
+
+```bash
+# Higher colour resolution
+ros2 launch delta_main_app matlab_bridge.launch.py color_profile:=1280x720x15
+
+# All overridable arguments with their defaults
+ros2 launch delta_main_app matlab_bridge.launch.py --show-args
+```
+
+| Argument | Default | Notes |
+|---|---|---|
+| `color_profile` | `640x480x30` | RealSense colour stream |
+| `depth_profile` | `424x240x6` | RealSense depth stream |
+| `align_depth_enable` | `false` | Align depth to colour frame |
+| `enable_accel` | `false` | IMU accelerometer |
+| `enable_gyro` | `false` | IMU gyroscope |
+| `unite_imu_method` | `0` | IMU fusion method |
+
+---
+
+### Option B — Manual (separate terminals)
+
+Use this when you want to restart just one node without stopping the others.
+
+```bash
+# Terminal 1 — camera stack
+source ~/delta_ws/install/setup.bash
+ros2 launch delta_main_app delta_main.launch.py
+```
+
+> `delta_main.launch.py` starts `realsense2_camera_node` + `camera_node`.
+> The camera system publishes confirmed detections to `/delta/target_xyz`.
+
+```bash
+# Terminal 2 — bridge node
+source ~/delta_ws/install/setup.bash
+ros2 run delta_main_app matlab_bridge
+```
+
+---
+
+### Step — Connect MATLAB
 
 Run the MATLAB script below.  MATLAB must be on the **same network** as the
 Ubuntu machine (or on the same machine) and able to reach ROS2 topics.
@@ -370,14 +406,16 @@ check how accurately the motors executed MATLAB's solution.
 
 ## Important: Do NOT run alongside `main_app`
 
-`matlab_bridge_node` and `delta_main_app` both consume `/delta/target_xyz` and
-both write to the same CAN motors.  Run **one or the other**, never both at the
-same time.
+`matlab_bridge_node` and `main_app` both consume `/delta/target_xyz` and write
+to the same CAN motors.  Run **one or the other**, never both at the same time.
 
 ```bash
-# Correct: bridge mode
+# MATLAB bridge mode (launch file — recommended)
+ros2 launch delta_main_app matlab_bridge.launch.py
+
+# MATLAB bridge mode (manual)
 ros2 run delta_main_app matlab_bridge
 
-# Correct: autonomous mode (Python IK)
-ros2 run delta_main_app main_app
+# Autonomous mode — Python IK, no MATLAB needed
+ros2 launch delta_main_app delta_main.launch.py
 ```
