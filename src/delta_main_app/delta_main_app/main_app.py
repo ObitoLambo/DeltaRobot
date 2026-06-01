@@ -292,17 +292,19 @@ class PickAndPlaceStateMachine:
                             break
 
                         dist_2d = math.sqrt(err_x**2 + err_y**2)
+                        # On conveyor, belt predictor owns Y timing — only correct X.
+                        check_err = abs(err_x) if config.CONVEYOR_MODE else dist_2d
                         self._log.info(
                             f"Correction iter {i}: "
                             f"err_x={err_x:+.1f}mm err_y={err_y:+.1f}mm "
-                            f"dist_2d={dist_2d:.1f}mm"
+                            f"check={check_err:.1f}mm"
                         )
 
-                        if dist_2d < config.EE_CORRECTION_MIN_MM:
+                        if check_err < config.EE_CORRECTION_MIN_MM:
                             self._log.info("Below MIN — done")
                             break
 
-                        if dist_2d < config.EE_CORRECTION_THRESH_MM:
+                        if check_err < config.EE_CORRECTION_THRESH_MM:
                             self._log.info("Converged")
                             break
 
@@ -311,9 +313,9 @@ class PickAndPlaceStateMachine:
                             break
 
                         x_new = x - err_x * config.EE_CORRECTION_GAIN
-                        y_new = y + err_y * config.EE_CORRECTION_GAIN
+                        # Y correction disabled in conveyor mode — belt predictor handles timing
+                        y_new = y if config.CONVEYOR_MODE else y + err_y * config.EE_CORRECTION_GAIN
 
-                        # Clamp to workspace instead of stopping
                         x_new = max(-config.X_LIMIT + 5.0,
                                 min( config.X_LIMIT - 5.0, x_new))
                         y_new = max(-config.Y_LIMIT + 5.0,

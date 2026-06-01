@@ -248,14 +248,14 @@ WORKSPACE_PICK_Z_MM  = -490.0   # platform Z at pick height (EE tip 150mm below 
 
 # EE marker detection (white laser dot on end-effector tip)
 EE_CORRECTION_ENABLE    = True
-EE_CORRECTION_MAX_MM    = 30.0  # ignore correction if error exceeds this (was 5 — too restrictive)
-EE_CORRECTION_ALPHA     = 0.5    # faster smoothing for moving belt (was 0.3)
-EE_CORRECTION_GAIN      = 0.6    # larger steps → converge in 2-3 iters (was 0.1)
-EE_CORRECTION_THRESH_MM = 6.0    # accept ≤6mm residual on fast conveyor (was 5)
-EE_CORRECTION_MIN_MM    = 2.0    # ignore sub-2mm noise
-EE_CORRECTION_MAX_ITERS = 10     # loop until object arrives + aligned (was 4)
-EE_CORRECTION_TIMEOUT_S = 4.0    # total correction window incl. object arrival (was 2)
-EE_CORRECTION_WAIT_S    = 0.05   # one camera frame settle (~33ms at 30fps)
+EE_CORRECTION_MAX_MM    = 30.0
+EE_CORRECTION_ALPHA     = 0.5
+EE_CORRECTION_GAIN      = 0.35   # smooth small steps; 3 iters: 15mm→10mm→6mm→done
+EE_CORRECTION_THRESH_MM = 8.0    # converge when X ≤ 8mm (conveyor: checked on dx only)
+EE_CORRECTION_MIN_MM    = 2.0
+EE_CORRECTION_MAX_ITERS = 3      # 3 X-only corrections → short and smooth
+EE_CORRECTION_TIMEOUT_S = 1.5
+EE_CORRECTION_WAIT_S    = 0.05
 EE_LASER_HUE_LOW1  = 0      # red lower range
 EE_LASER_HUE_HIGH1 = 10
 EE_LASER_HUE_LOW2  = 130    # magenta/pink: 650nm laser on D455 appears H≈150-165
