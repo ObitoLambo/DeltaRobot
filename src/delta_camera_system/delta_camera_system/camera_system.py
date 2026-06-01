@@ -3,7 +3,6 @@
 # CHANGES: [1.1] depth lock and stale-depth protection, [1.2] reusable CLAHE/kernel allocation, [2.1] config validation, [2.3] stable anchor fix, [2.5] target/status publishers, [2.6] centralized tracking reset
 
 import math
-import threading
 import time
 from collections import deque
 from typing import Optional
@@ -30,9 +29,6 @@ class DeltaCamera(Node):
         self.bridge = CvBridge()
         self.DETECTION_MODE = config.DETECTION_MODE.lower()
         self.model = YOLO(config.YOLO_MODEL) if self.DETECTION_MODE == "yolo" else None
-        self.latest_depth_msg: Optional[Image] = None
-        self._depth_lock = threading.Lock()
-        self.latest_depth_stamp = None
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         self._kernel_5 = np.ones((5, 5), dtype=np.uint8)
 
@@ -66,15 +62,10 @@ class DeltaCamera(Node):
 
         self._xyz_buffers: dict = {}        # per-track xyz history
         self._timed_xyz_bufs: dict = {}     # per-track timestamped xyz history
-        self.depth_buffer = deque(maxlen=config.DEPTH_HISTORY_SIZE)
-        self.last_depth_track_id = None
         self.last_stable_xyz = None
 
         self.sub_color = self.create_subscription(
             Image, config.COLOR_TOPIC, self.color_callback, 10
-        )
-        self.sub_depth = self.create_subscription(
-            Image, config.DEPTH_TOPIC, self.depth_callback, 10
         )
         self.sub_info = self.create_subscription(
             CameraInfo, config.CAMERA_INFO_TOPIC, self.info_callback, 10
@@ -91,9 +82,8 @@ class DeltaCamera(Node):
             PointStamped, "/delta/ee_fk_xyz", self._ee_fk_callback, 10
         )
 
-        mode = "FAKE DEPTH" if config.FAKE_DEPTH_ENABLE else "REAL DEPTH"
         self.get_logger().info(
-            f"Delta camera system ready ({mode}, detection={self.DETECTION_MODE})"
+            f"Delta camera system ready (2D-only, fixed Z={config.FAKE_DEPTH_M}m, detection={self.DETECTION_MODE})"
         )
 
         if self.VIEW_IMAGE:
@@ -124,11 +114,6 @@ class DeltaCamera(Node):
         else:
             self.dist_coeffs = np.zeros((5, 1), dtype=np.float64)
 
-    def depth_callback(self, msg: Image):
-        with self._depth_lock:
-            self.latest_depth_msg = msg
-            self.latest_depth_stamp = self.get_clock().now()
-
     def color_callback(self, msg: Image):
         if self.fx is None:
             return
@@ -143,6 +128,7 @@ class DeltaCamera(Node):
             return
 
         annotated, best = self.process_frame(frame)
+
 
         t_end = time.perf_counter()
         self._proc_times.append(t_end - t_start)
@@ -172,7 +158,6 @@ class DeltaCamera(Node):
         annotated = frame.copy()
         best = None
         pure_camera_mode = bool(config.PURE_CAMERA_TEST_ENABLE)
-        depth_image = self.get_depth_image()
         frame_h, frame_w = frame.shape[:2]
         self.draw_workspace_overlay(annotated, frame_w, frame_h)
         if config.DRAW_CAMERA_AXIS_LEGEND:
@@ -188,17 +173,7 @@ class DeltaCamera(Node):
         )
         if ee_uv is not None:
             eu, ev = ee_uv
-            ee_z_m = None
-            if depth_image is not None:
-                r = 8  # sample within 8px of EE centroid
-                vals = self.collect_depth_values_meters(
-                    depth_image, eu, ev, eu - r, ev - r, eu + r, ev + r)
-                z_robust = self.robust_depth_from_values(vals)
-                if z_robust is not None:
-                    ee_z_m = z_robust
-            if ee_z_m is None:
-                ee_z_m = config.FAKE_DEPTH_M
-            ee_cam = self.pixel_to_camera_xyz_mm(eu, ev, ee_z_m)
+            ee_cam = self.pixel_to_camera_xyz_mm(eu, ev, config.FAKE_DEPTH_M)
             if ee_cam is not None:
                 ex_b, ey_b, ez_b = self.camera_to_base_mm(*ee_cam)
                 ee_pixel = (eu, ev)
@@ -215,7 +190,7 @@ class DeltaCamera(Node):
                 cv2.putText(annotated, "EE", (eu + 8, ev),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255, 255, 0), 1)
 
-        detections = self.generate_detections(frame, depth_image)
+        detections = self.generate_detections(frame, None)
         if not detections:
             self.handle_no_detection()
             return annotated, best
@@ -291,41 +266,9 @@ class DeltaCamera(Node):
                 for corner in np.round(corners_uv).astype(np.int32):
                     cv2.circle(annotated, tuple(corner.tolist()), 4, (0, 255, 255), -1)
 
-            depth_x1, depth_y1, depth_x2, depth_y2 = (
-                depth_bbox if depth_bbox is not None else (x1, y1, x2, y2)
-            )
+            z_m = config.FAKE_DEPTH_M
 
-            z_m = self.get_depth_meters(
-                depth_image,
-                u,
-                v,
-                depth_x1,
-                depth_y1,
-                depth_x2,
-                depth_y2,
-                track_id,
-                contour=depth_contour if depth_contour is not None else center_contour,
-            )
-            depth_is_approx = False
-            if z_m is None:
-                if config.FAKE_DEPTH_ENABLE:
-                    z_m = config.FAKE_DEPTH_M
-                    depth_is_approx = True
-                else:
-                    label = f"{name} {conf:.2f} C=({u},{v}) NO_DEPTH"
-                    cv2.putText(
-                        annotated,
-                        label,
-                        (x1, max(20, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 0, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-                    continue
-
-            print(f"DETECT: conf={conf:.2f} pixel=({u},{v}) depth={z_m}")
+            print(f"DETECT: conf={conf:.2f} pixel=({u},{v})")
 
             xyz_cam = self.pixel_to_camera_xyz_mm(u, v, z_m)
             if xyz_cam is None:
@@ -426,12 +369,7 @@ class DeltaCamera(Node):
             pose_yaw = None if pose_info is None else pose_info["pose_yaw_deg"]
             display_yaw = pose_yaw if pose_yaw is not None else plane_yaw_deg
 
-            if depth_is_approx:
-                label_color = (0, 255, 255)   # yellow — approximate depth
-            elif allowed:
-                label_color = (0, 255, 0)
-            else:
-                label_color = (0, 0, 255)
+            label_color = (0, 255, 0) if allowed else (0, 0, 255)
             if pure_camera_mode:
                 label = f"{name} {conf:.2f} CAM=({x_cam:.1f},{y_cam:.1f},{z_cam:.1f}) {reason}"
             elif config.VISION_ONLY_ENABLE:
@@ -442,8 +380,6 @@ class DeltaCamera(Node):
                 if display_yaw is not None:
                     label += f"YAW={display_yaw:.1f} "
                 label += reason
-                if depth_is_approx:
-                    label += " APPROX"
             else:
                 label = (
                     f"{name} {conf:.2f} "
@@ -451,8 +387,6 @@ class DeltaCamera(Node):
                     f"BASE=({x_use:.1f},{y_use:.1f},{z_use:.1f}) "
                     f"{theta_text}{reason}"
                 )
-                if depth_is_approx:
-                    label += " APPROX"
             label_y = max(20, y1 - 8)
             cv2.putText(
                 annotated,
@@ -1028,8 +962,6 @@ class DeltaCamera(Node):
     def reset_tracking_state(self):
         self._xyz_buffers.clear()
         self._timed_xyz_bufs.clear()
-        self.depth_buffer.clear()
-        self.last_depth_track_id = None
         self.last_stable_xyz = None
         self._confirm_counts = {}
         self.no_detection_count = 0
@@ -2047,32 +1979,6 @@ class DeltaCamera(Node):
     def refine_center_from_roi(self, frame, x1, y1, x2, y2):
         bbox_center, contour = self.extract_primary_contour(frame, x1, y1, x2, y2)
         return self.contour_center_or_bbox(bbox_center, contour)
-
-    def get_depth_image(self):
-        if config.FAKE_DEPTH_ENABLE:
-            return None
-
-        with self._depth_lock:
-            msg = self.latest_depth_msg
-            stamp = self.latest_depth_stamp
-
-        if msg is None:
-            return None
-
-        if stamp is not None:
-            age_sec = (self.get_clock().now() - stamp).nanoseconds / 1e9
-            if age_sec > 0.5:
-                self.get_logger().warn(
-                    "Depth image stale ({:.2f}s) — check RealSense connection".format(age_sec),
-                    throttle_duration_sec=2.0,
-                )
-                return None
-
-        try:
-            return self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
-        except Exception as ex:
-            self.get_logger().warning(f"Depth conversion failed: {ex}")
-            return None
 
     def get_depth_meters(
         self,

@@ -329,7 +329,7 @@ class PickAndPlaceStateMachine:
                     time.sleep(0.1)
 
             self._set_state("PICKING")
-            pick_z = _clamp_z(z_platform + config.PICK_Z_EXTRA_MM)
+            pick_z = _clamp_z(config.PICK_Z)
             if not self._move(x, y, pick_z):
                 raise RuntimeError("PICK descend failed")
             time.sleep(MOVE_SETTLE_SEC)
@@ -347,7 +347,7 @@ class PickAndPlaceStateMachine:
             time.sleep(MOVE_SETTLE_SEC)
 
             self._set_state("TRANSPORTING")
-            place_z = _clamp_z(config.PLACE_Z + config.PLACE_Z_EXTRA_MM)
+            place_z = _clamp_z(config.PLACE_Z)
             if not self._move(config.PLACE_X, config.PLACE_Y, place_z):
                 raise RuntimeError("TRANSPORT failed")
             time.sleep(MOVE_SETTLE_SEC)

@@ -170,7 +170,8 @@ HOME_Z = -350.0
 # Drop at belt exit edge — Y = -150mm
 PLACE_X =   0.0
 PLACE_Y = -150.0
-PLACE_Z = -490.0   # platform Z for drop-off (EE tip 150mm below = -650mm physical)
+PLACE_Z = -490.0   # wrist Z for place  (EE tip = PLACE_Z - 150mm)
+PICK_Z  = -490.0   # wrist Z for pick   (EE tip = PICK_Z  - 150mm)
 
 # Acceleration used for triangular travel-time prediction (medium preset).
 # Within ±150mm workspace all moves are triangular: t = 2*sqrt(dist / TRAJ_A_MAX_MM_S2)
@@ -179,7 +180,7 @@ TRAJ_A_MAX_MM_S2 = 5000.0
 # Extra wait at approach Z (mm above object) after robot pre-positions.
 # Gives the object time to arrive if Y prediction is still slightly off.
 # Increase in small steps (0.1 s) if robot still arrives before object.
-CONVEYOR_APPROACH_WAIT_SEC = 1.0
+CONVEYOR_APPROACH_WAIT_SEC = 1.5
 
 # Static EE correction offsets (mm).  Measure the real error at your target
 # position and set each offset to negate it: if the EE lands 10 mm too far in
@@ -187,8 +188,6 @@ CONVEYOR_APPROACH_WAIT_SEC = 1.0
 EE_OFFSET_X_MM = 0.0
 EE_OFFSET_Y_MM = 0.0
 EE_OFFSET_Z_MM   = -60.0  # camera now reports platform Z directly via FAKE_DEPTH_M=0.530
-PICK_Z_EXTRA_MM  = -65.0  # extra descent at pick (negative = deeper); tune in ±5mm steps
-PLACE_Z_EXTRA_MM = -65.0  # extra descent at place (negative = deeper); tune in ±5mm steps
 
 # Grid error map (replaces static EE_OFFSET when enabled).
 # Build the map with measure_error_grid.py, then flip this to True.
@@ -307,14 +306,14 @@ CAMERA_T_BASE = (
 
 X_LIMIT = 150.0   # rectangular pre-filter; IK in check_workspace rejects unreachable corners
 Y_LIMIT = 150.0
-Z_MIN = -510.0
+Z_MIN = -560.0
 # Actual IK ceiling at centre: -sqrt(re^2 - (rf + (f-e)*tan30/2)^2) ≈ -323.5 mm.
 # The old value (-196.875) was geometrically wrong; any Z above -323 fails IK.
 Z_MAX = -323.0
 
 THETA1_MIN = -5
-THETA1_MAX = 67   # physical hard stop observed at ~56° — use 54° with 2° margin
+THETA1_MAX = 90   # physical hard stop observed at ~56° — use 54° with 2° margin
 THETA2_MIN = -5
-THETA2_MAX = 67.0
+THETA2_MAX = 90.0
 THETA3_MIN = -5
-THETA3_MAX = 67.0
+THETA3_MAX = 90.0
