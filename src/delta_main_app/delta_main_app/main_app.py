@@ -488,6 +488,7 @@ class DeltaMainApp(Node):
             f"Z_workspace=[{config.Z_MIN:.0f}, {config.Z_MAX:.0f}] mm  "
             f"place=({config.PLACE_X:.0f}, {config.PLACE_Y:.0f}, {config.PLACE_Z:.0f}) mm"
         )
+        self._homing = True  # blocks pick queue until startup home completes
         self.get_logger().info("main_app node started, waiting for detections...")
         threading.Thread(target=self._startup_home, daemon=True).start()
 
@@ -542,6 +543,8 @@ class DeltaMainApp(Node):
         self._belt_vy_mm_s = msg.point.y
 
     def _queue_timer(self) -> None:
+        if self._homing:
+            return
         with self._queue_lock:
             if self._fsm.state == "IDLE" and self._target_queue:
                 self.get_logger().info(
@@ -647,12 +650,14 @@ class DeltaMainApp(Node):
     def _startup_home(self) -> None:
         time.sleep(0.5)
         self.get_logger().info("Startup: opening gripper and homing to workspace center")
-        self._send_gripper(0.0)
+        self._send_gripper(0.0)          # open gripper
         if config.ENABLE_MOTORS:
             self._ctrl.move_xyz(HOME_X, HOME_Y, HOME_Z, raw=True)
+        self._homing = False             # allow picks once arm is at home
 
     def destroy_node(self) -> None:
-        self._send_gripper(0.0)
+        self._homing = True              # stop new picks immediately
+        self._send_gripper(0.0)          # open gripper (ROS + direct CAN)
         if config.ENABLE_MOTORS:
             try:
                 self._ctrl.move_xyz(HOME_X, HOME_Y, HOME_Z, raw=True)
@@ -660,6 +665,8 @@ class DeltaMainApp(Node):
             except Exception:
                 pass
             self._ctrl.shutdown()
+        if config.ENABLE_MOTORS:
+            self._gripper.disconnect()   # explicit release + close bus before GC
         super().destroy_node()
 
 
