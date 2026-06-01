@@ -189,6 +189,9 @@ EE_OFFSET_X_MM = 0.0
 EE_OFFSET_Y_MM = 0.0
 EE_OFFSET_Z_MM   = -60.0  # camera now reports platform Z directly via FAKE_DEPTH_M=0.530
 
+FAKE_DEPTH_ENABLE = True
+FAKE_DEPTH_M = 0.530      # fixed camera-to-belt distance (m); tune if belt Z drifts
+
 # Grid error map (replaces static EE_OFFSET when enabled).
 # Build the map with measure_error_grid.py, then flip this to True.
 ERROR_MAP_ENABLE = False
@@ -204,18 +207,13 @@ ENABLE_MOTORS = True
 MOVE_COOLDOWN_SEC = 1.5
 MOVE_THRESHOLD_MM = 4.0
 
-FAKE_DEPTH_ENABLE = True
-FAKE_DEPTH_M = 0.530
 # z_base = -530 + CAM_TZ_MM(-20) = -550mm = belt surface
 # z_platform = -550 - EE_OFFSET_Z_MM(-60) = -490mm
 
 # Fixed fake object position for testing EE correction
 # Set FAKE_OBJ_ENABLE = True to use fixed position
 # instead of real camera detection
-FAKE_OBJ_ENABLE = False
-FAKE_OBJ_X_MM   =  0.0   # robot base frame mm
-FAKE_OBJ_Y_MM   =  0.0   # center of workspace
-FAKE_OBJ_Z_MM   = -490.0 # belt surface (EE tip level)
+
 
 VISION_ONLY_ENABLE = False
 SIMPLE_RESULT_PRINT = False
@@ -249,14 +247,14 @@ WORKSPACE_PICK_Z_MM  = -490.0   # platform Z at pick height (EE tip 150mm below 
 
 # EE marker detection (white laser dot on end-effector tip)
 EE_CORRECTION_ENABLE    = True
-EE_CORRECTION_MAX_MM    = 60.0   # ignore correction if error exceeds this
+EE_CORRECTION_MAX_MM    = 5.0   # ignore correction if error exceeds this
 EE_CORRECTION_ALPHA     = 0.3    # exponential smoothing factor
-EE_CORRECTION_GAIN      = 0.3    # small steps → smooth motion, no overshoot
+EE_CORRECTION_GAIN      = 0.1    # small steps → smooth motion, no overshoot
 EE_CORRECTION_THRESH_MM = 5.0    # above noise floor (±3-4mm)
-EE_CORRECTION_MIN_MM    = 2.0    # ignore sub-2mm errors
-EE_CORRECTION_MAX_ITERS = 10     # more iters of small steps = smooth convergence
-EE_CORRECTION_TIMEOUT_S = 15.0   # 10 iters × ~1.5s each
-EE_CORRECTION_WAIT_S    = 0.2    # short settle — small moves settle fast
+EE_CORRECTION_MIN_MM    = 1.0    # ignore sub-2mm errors
+EE_CORRECTION_MAX_ITERS = 25     # more iters of small steps = smooth convergence
+EE_CORRECTION_TIMEOUT_S = 10.0   # 10 iters × ~1.5s each
+EE_CORRECTION_WAIT_S    = 0.05    # short settle — small moves settle fast
 EE_LASER_HUE_LOW1  = 0      # red lower range
 EE_LASER_HUE_HIGH1 = 10
 EE_LASER_HUE_LOW2  = 130    # magenta/pink: 650nm laser on D455 appears H≈150-165
@@ -291,8 +289,8 @@ CAMERA_DIRECT_MATRIX = (
 CAM_FINE_ROLL_DEG  = 0.0
 CAM_FINE_PITCH_DEG = 0.0
 CAM_FINE_YAW_DEG   = 0.0
-CAM_TX_MM =  -15.0   # tuning — adjust in ±10mm steps until green box centres under arm
-CAM_TY_MM = 245.0    # calculated: EE dot at y=38px (exit Y=-150mm) → crosshair at 161px → T_Y=96≈100mm
+CAM_TX_MM =  -20.0   # tuning — adjust in ±10mm steps until green box centres under arm
+CAM_TY_MM = 255.0    # calculated: EE dot at y=38px (exit Y=-150mm) → crosshair at 161px → T_Y=96≈100mm
 CAM_TZ_MM =  -20.0   # measured: camera is 20 mm below base frame origin
 
 # Full 4×4 homogeneous T_cam_to_base  (p_base = T @ [p_cam; 1])
