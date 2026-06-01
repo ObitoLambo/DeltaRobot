@@ -558,19 +558,27 @@ class DeltaMainApp(Node):
             x, y, z = self._target_queue.pop(0)
 
             result = self._predictor.predict(x, y)
-            if not result.valid:
-                self.get_logger().warn(
-                    f"Predicted pick ({x:.1f}, {result.y_pick:.1f}, {z:.1f}) outside workspace "
-                    f"or insufficient belt data — skipped"
-                )
-                return
-            if not check_workspace(x, result.y_pick, z - config.EE_OFFSET_Z_MM):
-                self.get_logger().warn(
-                    f"Predicted pick ({x:.1f}, {result.y_pick:.1f}, {z:.1f}) outside workspace — skipped"
-                )
-                return
             x_pick = x
             y_pick = result.y_pick
+            if not result.valid:
+                # Object is in approach zone — predicted pick still outside workspace.
+                # Pre-position at workspace boundary now; arrival gate holds until object arrives.
+                if y > config.Y_LIMIT and abs(x) <= config.X_LIMIT:
+                    y_pick = config.Y_LIMIT - 5.0
+                    self.get_logger().info(
+                        f"Approach zone: pre-positioning at Y={y_pick:.1f}mm "
+                        f"(object at Y={y:.1f}, predicted Y={result.y_pick:.1f})"
+                    )
+                else:
+                    self.get_logger().warn(
+                        f"Predicted pick ({x:.1f}, {result.y_pick:.1f}) outside workspace — skipped"
+                    )
+                    return
+            elif not check_workspace(x, y_pick, z - config.EE_OFFSET_Z_MM):
+                self.get_logger().warn(
+                    f"Predicted pick ({x:.1f}, {y_pick:.1f}, {z:.1f}) outside workspace — skipped"
+                )
+                return
             if config.ERROR_MAP_ENABLE:
                 dx, dy, _ = error_map.correction(x_pick, y_pick, z, config.ERROR_MAP_FILE)
                 x_pick -= dx
