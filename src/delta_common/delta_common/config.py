@@ -170,8 +170,9 @@ HOME_Z = -350.0
 # Drop at belt exit edge — Y = -150mm
 PLACE_X =   0.0
 PLACE_Y = -150.0
-PLACE_Z = -510.0   # wrist Z for place  (EE tip = PLACE_Z - 150mm)
-PICK_Z  = -510.0   # wrist Z for pick   (EE tip = PICK_Z  - 150mm)
+
+PLACE_Z = -530.0   # wrist Z for place  (EE tip = PLACE_Z - 150 = -700mm)
+PICK_Z  = -530.0   # wrist Z for pick   (EE tip = PICK_Z  - 150 = -700mm)
 
 # Acceleration used for triangular travel-time prediction (medium preset).
 # Within ±150mm workspace all moves are triangular: t = 2*sqrt(dist / TRAJ_A_MAX_MM_S2)
@@ -180,7 +181,7 @@ TRAJ_A_MAX_MM_S2 = 5000.0
 # Extra wait at approach Z (mm above object) after robot pre-positions.
 # Gives the object time to arrive if Y prediction is still slightly off.
 # Increase in small steps (0.1 s) if robot still arrives before object.
-CONVEYOR_APPROACH_WAIT_SEC = 1.5
+CONVEYOR_APPROACH_WAIT_SEC = 0.3   # short settle before correction starts (was 1.5)
 
 # Static EE correction offsets (mm).  Measure the real error at your target
 # position and set each offset to negate it: if the EE lands 10 mm too far in
@@ -247,14 +248,14 @@ WORKSPACE_PICK_Z_MM  = -490.0   # platform Z at pick height (EE tip 150mm below 
 
 # EE marker detection (white laser dot on end-effector tip)
 EE_CORRECTION_ENABLE    = True
-EE_CORRECTION_MAX_MM    = 5.0   # ignore correction if error exceeds this
-EE_CORRECTION_ALPHA     = 0.3    # exponential smoothing factor
-EE_CORRECTION_GAIN      = 0.1    # small steps → smooth motion, no overshoot
-EE_CORRECTION_THRESH_MM = 5.0    # above noise floor (±3-4mm)
-EE_CORRECTION_MIN_MM    = 1.0    # ignore sub-2mm errors
-EE_CORRECTION_MAX_ITERS = 25     # more iters of small steps = smooth convergence
-EE_CORRECTION_TIMEOUT_S = 10.0   # 10 iters × ~1.5s each
-EE_CORRECTION_WAIT_S    = 0.05    # short settle — small moves settle fast
+EE_CORRECTION_MAX_MM    = 30.0  # ignore correction if error exceeds this (was 5 — too restrictive)
+EE_CORRECTION_ALPHA     = 0.5    # faster smoothing for moving belt (was 0.3)
+EE_CORRECTION_GAIN      = 0.6    # larger steps → converge in 2-3 iters (was 0.1)
+EE_CORRECTION_THRESH_MM = 6.0    # accept ≤6mm residual on fast conveyor (was 5)
+EE_CORRECTION_MIN_MM    = 2.0    # ignore sub-2mm noise
+EE_CORRECTION_MAX_ITERS = 4      # max 4 corrections on conveyor (was 25)
+EE_CORRECTION_TIMEOUT_S = 2.0    # hard 2s limit per pick (was 10)
+EE_CORRECTION_WAIT_S    = 0.05   # one camera frame settle (~33ms at 30fps)
 EE_LASER_HUE_LOW1  = 0      # red lower range
 EE_LASER_HUE_HIGH1 = 10
 EE_LASER_HUE_LOW2  = 130    # magenta/pink: 650nm laser on D455 appears H≈150-165

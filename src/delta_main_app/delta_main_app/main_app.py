@@ -221,7 +221,7 @@ class PickAndPlaceStateMachine:
         """
         deadline = time.time() + timeout
         samples_x, samples_y = [], []
-        while time.time() < deadline and len(samples_x) < 3:
+        while time.time() < deadline and len(samples_x) < 2:
             with self._lock:
                 self._ee_error_x = None
                 self._ee_error_y = None
