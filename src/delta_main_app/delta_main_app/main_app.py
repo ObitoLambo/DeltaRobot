@@ -472,6 +472,7 @@ class DeltaMainApp(Node):
             f"place=({config.PLACE_X:.0f}, {config.PLACE_Y:.0f}, {config.PLACE_Z:.0f}) mm"
         )
         self.get_logger().info("main_app node started, waiting for detections...")
+        threading.Thread(target=self._startup_home, daemon=True).start()
 
     def _publish_ee_fk_timer(self) -> None:
         xyz = self._fsm._current_ee_xyz
@@ -625,6 +626,13 @@ class DeltaMainApp(Node):
             self.get_logger().warn(msg)
         else:
             self.get_logger().info(msg)
+
+    def _startup_home(self) -> None:
+        time.sleep(0.5)
+        self.get_logger().info("Startup: opening gripper and homing to workspace center")
+        self._send_gripper(0.0)
+        if config.ENABLE_MOTORS:
+            self._ctrl.move_xyz(HOME_X, HOME_Y, HOME_Z, raw=True)
 
     def destroy_node(self) -> None:
         self._send_gripper(0.0)
