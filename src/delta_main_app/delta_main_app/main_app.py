@@ -271,7 +271,22 @@ class PickAndPlaceStateMachine:
                 if not self._move(x, y, az):
                     raise RuntimeError("APPROACH failed")
                 time.sleep(MOVE_SETTLE_SEC)
-                if config.CONVEYOR_APPROACH_WAIT_SEC > 0:
+
+                # ── Dynamic arrival gate ─────────────────────────────────────
+                # Wait at approach Z until the object is under the EE in Y
+                # (|err_y| < threshold).  This replaces the fixed approach wait
+                # and adapts automatically to belt speed variation.
+                if config.CONVEYOR_MODE and config.EE_CORRECTION_ENABLE:
+                    deadline_arr = time.time() + config.CONVEYOR_ARRIVAL_TIMEOUT_S
+                    while time.time() < deadline_arr:
+                        _, ey = self._wait_fresh_ee_error(timeout=0.1)
+                        if ey is None:
+                            break
+                        self._log.info(f"Arrival wait: err_y={ey:+.1f}mm")
+                        if abs(ey) < config.CONVEYOR_ARRIVAL_Y_THRESH_MM:
+                            self._log.info("Object arrived under EE")
+                            break
+                elif config.CONVEYOR_APPROACH_WAIT_SEC > 0:
                     time.sleep(config.CONVEYOR_APPROACH_WAIT_SEC)
 
                 if config.EE_CORRECTION_ENABLE:

@@ -168,11 +168,11 @@ HOME_Y =   0.0
 HOME_Z = -350.0
 
 # Drop at belt exit edge — Y = -150mm
-PLACE_X =   0.0
+PLACE_X =  150.0
 PLACE_Y = -150.0
 
-PLACE_Z = -530.0   # wrist Z for place  (EE tip = PLACE_Z - 150 = -700mm)
-PICK_Z  = -530.0   # wrist Z for pick   (EE tip = PICK_Z  - 150 = -700mm)
+PLACE_Z = -500.0   # wrist Z for place  (EE tip = PLACE_Z - 150 = -700mm)
+PICK_Z  = -535.0   # wrist Z for pick   (EE tip = PICK_Z  - 150 = -700mm)
 
 # Acceleration used for triangular travel-time prediction (medium preset).
 # Within ±150mm workspace all moves are triangular: t = 2*sqrt(dist / TRAJ_A_MAX_MM_S2)
@@ -181,7 +181,9 @@ TRAJ_A_MAX_MM_S2 = 5000.0
 # Extra wait at approach Z (mm above object) after robot pre-positions.
 # Gives the object time to arrive if Y prediction is still slightly off.
 # Increase in small steps (0.1 s) if robot still arrives before object.
-CONVEYOR_APPROACH_WAIT_SEC = 0.8   # wait for object to arrive under EE before correcting
+CONVEYOR_APPROACH_WAIT_SEC = 0.3   # short motor-settle; arrival now handled dynamically
+CONVEYOR_ARRIVAL_Y_THRESH_MM = 15.0  # pick when |err_y| < this (object within 15mm in Y)
+CONVEYOR_ARRIVAL_TIMEOUT_S   = 5.0   # give up and pick anyway after 5s
 
 # Static EE correction offsets (mm).  Measure the real error at your target
 # position and set each offset to negate it: if the EE lands 10 mm too far in
