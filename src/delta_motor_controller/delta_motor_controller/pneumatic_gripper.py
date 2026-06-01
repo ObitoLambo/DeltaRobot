@@ -12,8 +12,8 @@ CAN frame format (reverse-engineered from can_driver.py):
     is_extended_id = False
 
 Hardware convention (verified with testing_solenoid.py):
-    solenoid1_value = True  →  GRIP
-    solenoid1_value = False →  RELEASE
+    solenoid1_value = True  →  RELEASE (open)
+    solenoid1_value = False →  GRIP   (close)
 """
 
 import time
@@ -63,14 +63,14 @@ class PneumaticGripper:
     # ── control ────────────────────────────────────────────────────────────────
 
     def grip(self, wait: bool = True) -> None:
-        """Activate suction / close jaws to hold the object."""
-        self._send(solenoid1=True)
+        """Close jaws / activate hold."""
+        self._send(solenoid1=False)
         if wait:
             time.sleep(self._grip_settle_s)
 
     def release(self, wait: bool = True) -> None:
-        """Deactivate suction / open jaws to drop the object."""
-        self._send(solenoid1=False)
+        """Open jaws / release object."""
+        self._send(solenoid1=True)
         if wait:
             time.sleep(self._open_settle_s)
 
