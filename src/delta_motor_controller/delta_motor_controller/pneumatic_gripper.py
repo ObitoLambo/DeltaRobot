@@ -12,8 +12,9 @@ CAN frame format (reverse-engineered from can_driver.py):
     is_extended_id = False
 
 Hardware convention (verified with testing_solenoid.py):
-    solenoid1_value = True  →  GRIP
-    solenoid1_value = False →  RELEASE
+    Board uses active-low outputs: data[2] bit=0 → solenoid energized (ON)
+    solenoid1 bit=0 (False in data) →  GRIP   (energized)
+    solenoid1 bit=1 (True  in data) →  RELEASE (de-energized)
 """
 
 import time
@@ -63,14 +64,14 @@ class PneumaticGripper:
     # ── control ────────────────────────────────────────────────────────────────
 
     def grip(self, wait: bool = True) -> None:
-        """Activate suction / close jaws to hold the object."""
-        self._send(solenoid1=True)
+        """Energize solenoid1 to grip (active-low: bit=0 → ON)."""
+        self._send(solenoid1=False)
         if wait:
             time.sleep(self._grip_settle_s)
 
     def release(self, wait: bool = True) -> None:
-        """Deactivate suction / open jaws to drop the object."""
-        self._send(solenoid1=False)
+        """De-energize solenoid1 to release (active-low: bit=1 → OFF)."""
+        self._send(solenoid1=True)
         if wait:
             time.sleep(self._open_settle_s)
 
@@ -84,14 +85,18 @@ class PneumaticGripper:
 
     # ── internal ───────────────────────────────────────────────────────────────
 
-    def _send(self, solenoid1: bool = False, solenoid2: bool = False) -> None:
+    def _send(self, solenoid1: bool = True, solenoid2: bool = True) -> None:
+        # Active-low board: bit=0 → solenoid energized (ON), bit=1 → de-energized (OFF).
+        # Defaults are True (OFF) so unused solenoids 2-6 stay de-energized.
         if self._bus is None:
             print('PneumaticGripper: send called before connect()')
             return
         data = [0] * 8
         data[0] = 0x40
-        data[1] = 0                           # digital bits (unused)
-        data[2] = int(solenoid1) | (int(solenoid2) << 1)
+        data[1] = 0
+        data[2] = (int(solenoid1)       |   # bit 0
+                   int(solenoid2) << 1  |   # bit 1
+                   0b00111100)              # bits 2-5 always 1 (OFF)
         msg = can.Message(
             arbitration_id=self._can_id,
             data=data,
