@@ -170,8 +170,8 @@ HOME_Z = -350.0
 # Drop at belt exit edge — Y = -150mm
 PLACE_X =   0.0
 PLACE_Y = -150.0
-PLACE_Z = -490.0   # wrist Z for place  (EE tip = PLACE_Z - 150mm)
-PICK_Z  = -490.0   # wrist Z for pick   (EE tip = PICK_Z  - 150mm)
+PLACE_Z = -510.0   # wrist Z for place  (EE tip = PLACE_Z - 150mm)
+PICK_Z  = -510.0   # wrist Z for pick   (EE tip = PICK_Z  - 150mm)
 
 # Acceleration used for triangular travel-time prediction (medium preset).
 # Within ±150mm workspace all moves are triangular: t = 2*sqrt(dist / TRAJ_A_MAX_MM_S2)
@@ -289,8 +289,8 @@ CAMERA_DIRECT_MATRIX = (
 CAM_FINE_ROLL_DEG  = 0.0
 CAM_FINE_PITCH_DEG = 0.0
 CAM_FINE_YAW_DEG   = 0.0
-CAM_TX_MM =  -20.0   # tuning — adjust in ±10mm steps until green box centres under arm
-CAM_TY_MM = 255.0    # calculated: EE dot at y=38px (exit Y=-150mm) → crosshair at 161px → T_Y=96≈100mm
+CAM_TX_MM =  -10.0   # tuning — adjust in ±10mm steps until green box centres under arm
+CAM_TY_MM = 235.0    # calculated: EE dot at y=38px (exit Y=-150mm) → crosshair at 161px → T_Y=96≈100mm
 CAM_TZ_MM =  -20.0   # measured: camera is 20 mm below base frame origin
 
 # Full 4×4 homogeneous T_cam_to_base  (p_base = T @ [p_cam; 1])

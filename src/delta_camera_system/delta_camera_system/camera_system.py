@@ -494,7 +494,23 @@ class DeltaCamera(Node):
                     vel.point.y = self._estimate_vy(best_timed_buf)
                     self._pub_velocity.publish(vel)
 
-        allowed_targets = [c for c in all_candidates if c["allowed"]]
+        # Sort by Y ascending: lowest Y = most advanced on conveyor = pick first (#1)
+        all_candidates.sort(key=lambda c: c["y_base"])
+
+        # Draw pick-order numbered badges on every detected object
+        for pick_num, c in enumerate(all_candidates, start=1):
+            u, v = c["u"], c["v"]
+            badge_col = (0, 200, 50) if c["allowed"] else (0, 140, 255)
+            cy_badge = v - 20
+            cv2.circle(annotated, (u, cy_badge), 12, badge_col, -1)
+            cv2.circle(annotated, (u, cy_badge), 12, (0, 0, 0), 1)
+            txt = str(pick_num)
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.putText(annotated, txt,
+                        (u - tw // 2, cy_badge + th // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+        allowed_targets = [c for c in all_candidates if c["allowed"]]  # already Y-sorted
         if allowed_targets:
             pa = PoseArray()
             pa.header.stamp = self.get_clock().now().to_msg()

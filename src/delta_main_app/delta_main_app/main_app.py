@@ -512,7 +512,7 @@ class DeltaMainApp(Node):
             ]
             if not candidates:
                 return
-            candidates.sort(key=lambda p: math.sqrt(p[0] ** 2 + p[1] ** 2))
+            candidates.sort(key=lambda p: p[1])  # ascending Y: lowest = most advanced on belt = pick first
             # Always feed the predictor so the regression window stays populated,
             # even while the robot is busy or a pick is already queued.
             self._predictor.update_velocity(candidates[0][1], time.time())
