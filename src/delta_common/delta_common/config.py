@@ -181,7 +181,7 @@ TRAJ_A_MAX_MM_S2 = 5000.0
 # Extra wait at approach Z (mm above object) after robot pre-positions.
 # Gives the object time to arrive if Y prediction is still slightly off.
 # Increase in small steps (0.1 s) if robot still arrives before object.
-CONVEYOR_APPROACH_WAIT_SEC = 0.3   # short settle before correction starts (was 1.5)
+CONVEYOR_APPROACH_WAIT_SEC = 0.8   # wait for object to arrive under EE before correcting
 
 # Static EE correction offsets (mm).  Measure the real error at your target
 # position and set each offset to negate it: if the EE lands 10 mm too far in
@@ -253,8 +253,8 @@ EE_CORRECTION_ALPHA     = 0.5    # faster smoothing for moving belt (was 0.3)
 EE_CORRECTION_GAIN      = 0.6    # larger steps → converge in 2-3 iters (was 0.1)
 EE_CORRECTION_THRESH_MM = 6.0    # accept ≤6mm residual on fast conveyor (was 5)
 EE_CORRECTION_MIN_MM    = 2.0    # ignore sub-2mm noise
-EE_CORRECTION_MAX_ITERS = 4      # max 4 corrections on conveyor (was 25)
-EE_CORRECTION_TIMEOUT_S = 2.0    # hard 2s limit per pick (was 10)
+EE_CORRECTION_MAX_ITERS = 10     # loop until object arrives + aligned (was 4)
+EE_CORRECTION_TIMEOUT_S = 4.0    # total correction window incl. object arrival (was 2)
 EE_CORRECTION_WAIT_S    = 0.05   # one camera frame settle (~33ms at 30fps)
 EE_LASER_HUE_LOW1  = 0      # red lower range
 EE_LASER_HUE_HIGH1 = 10
