@@ -171,8 +171,8 @@ HOME_Z = -350.0
 PLACE_X =  150.0
 PLACE_Y = -150.0
 
-PLACE_Z = -500.0   # wrist Z for place  (EE tip = PLACE_Z - 150 = -700mm)
-PICK_Z  = -535.0   # wrist Z for pick   (EE tip = PICK_Z  - 150 = -700mm)
+PLACE_Z = -460.0   # wrist Z for place  (EE tip = PLACE_Z - 150 = -610mm, 40mm above belt)
+PICK_Z  = -470.0   # wrist Z for pick   (EE tip = PICK_Z  - 150 = -620mm, 30mm above belt)
 
 # Acceleration used for triangular travel-time prediction (medium preset).
 # Within ±150mm workspace all moves are triangular: t = 2*sqrt(dist / TRAJ_A_MAX_MM_S2)
@@ -190,15 +190,12 @@ CONVEYOR_ARRIVAL_TIMEOUT_S   = 5.0   # give up and pick anyway after 5s
 # +X, set EE_OFFSET_X_MM = -10.0.
 EE_OFFSET_X_MM = 0.0
 EE_OFFSET_Y_MM = 0.0
-EE_OFFSET_Z_MM   = -60.0  # camera now reports platform Z directly via FAKE_DEPTH_M=0.530
+EE_OFFSET_Z_MM   = -60.0  # camera now reports platform Z directly via FAKE_DEPTH_M=0.650
 
 FAKE_DEPTH_ENABLE = True
-FAKE_DEPTH_M = 0.530      # fixed camera-to-belt distance (m); tune if belt Z drifts
+FAKE_DEPTH_M = 0.650      # fixed camera-to-belt distance (m); tune if belt Z drifts
 
-# Grid error map (replaces static EE_OFFSET when enabled).
-# Build the map with measure_error_grid.py, then flip this to True.
 ERROR_MAP_ENABLE = False
-ERROR_MAP_FILE   = "/home/s4mb4th/delta_ws/error_map.json"
 
 MOTOR_VEL_MAX    = 3.0   # PP mode max velocity — increase for faster moves (was 1.0)
 MOTOR_ACC_SET    = 5.0   # PP mode acceleration — increase for snappier starts (was 2.0)

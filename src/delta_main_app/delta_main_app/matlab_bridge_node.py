@@ -51,9 +51,11 @@ import math
 import threading
 import time
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PointStamped
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 
 from custom_messages.msg import DeltaTarget, DeltaJointAngles
@@ -259,6 +261,25 @@ class MatlabBridgeNode(Node):
             logger=self.get_logger(),
         )
 
+        # ── RealSense depth ───────────────────────────────────────────────────
+        # Camera intrinsics (filled on first CameraInfo message)
+        self._fx = self._fy = self._cx = self._cy = None
+
+        # Pre-build camera transforms from config so we can reverse-project
+        # base-frame coords back to pixel and then re-deproject with real depth.
+        R = np.array(config.CAMERA_DIRECT_MATRIX, dtype=np.float64)
+        t = np.array([config.CAM_TX_MM, config.CAM_TY_MM, config.CAM_TZ_MM],
+                     dtype=np.float64)
+        self._T_cam_to_base = np.eye(4, dtype=np.float64)
+        self._T_cam_to_base[:3, :3] = R
+        self._T_cam_to_base[:3, 3] = t
+        self._T_base_to_cam = np.eye(4, dtype=np.float64)
+        self._T_base_to_cam[:3, :3] = R.T
+        self._T_base_to_cam[:3, 3] = -R.T @ t
+
+        self._depth_lock = threading.Lock()
+        self._depth_image = None   # H×W uint16, each count = 1 mm
+
         # ── subscribers ───────────────────────────────────────────────────────
         self._sub_target = self.create_subscription(
             PointStamped,
@@ -271,6 +292,18 @@ class MatlabBridgeNode(Node):
             "/delta/matlab/joint_thetas",
             self._on_joint_angles,
             10,
+        )
+        self._sub_depth = self.create_subscription(
+            Image,
+            config.DEPTH_TOPIC,
+            self._on_depth_image,
+            1,
+        )
+        self._sub_cam_info = self.create_subscription(
+            CameraInfo,
+            config.CAMERA_INFO_TOPIC,
+            self._on_camera_info,
+            1,
         )
 
         # ── 10 Hz tick for MATLAB timeout ─────────────────────────────────────
@@ -288,28 +321,45 @@ class MatlabBridgeNode(Node):
     # ── callbacks ─────────────────────────────────────────────────────────────
 
     def _on_target_xyz(self, msg: PointStamped) -> None:
-        x = msg.point.x
+        x = msg.point.x   # metres, robot base frame
         y = msg.point.y
         z = msg.point.z
 
+        # Replace z with real RealSense depth when available
+        real = self._reproject_with_real_depth(x, y, z)
+        if real is not None:
+            x_real, y_real, z_real = real
+            self.get_logger().info(
+                f"RealSense depth: z_fake={z * 1000.0:.1f} mm → "
+                f"z_real={z_real * 1000.0:.1f} mm  "
+                f"(Δ={abs(z_real - z) * 1000.0:.1f} mm)"
+            )
+            x, y, z = x_real, y_real, z_real
+        else:
+            self.get_logger().warn(
+                "RealSense depth unavailable — using z from /delta/target_xyz "
+                f"(z={z * 1000.0:.1f} mm)"
+            )
+
         if not self._fsm.on_target(x, y, z):
             self.get_logger().warn(
-                f"Target ({x:.1f},{y:.1f},{z:.1f}) dropped — robot busy "
-                f"(state={self._fsm.state})"
+                f"Target ({x * 1000.0:.1f},{y * 1000.0:.1f},{z * 1000.0:.1f}) mm "
+                f"dropped — robot busy (state={self._fsm.state})"
             )
             return
 
         self.get_logger().info(
-            f"Target received: ({x:.1f},{y:.1f},{z:.1f}) mm — forwarding to MATLAB"
+            f"Target: ({x * 1000.0:.1f},{y * 1000.0:.1f},{z * 1000.0:.1f}) mm "
+            f"— forwarding to MATLAB"
         )
 
         out = DeltaTarget()
         out.header.stamp    = self.get_clock().now().to_msg()
         out.header.frame_id = "robot_base"
-        out.x_mm            = float(x)
-        out.y_mm            = float(y)
-        out.z_mm            = float(z)
-        out.confidence      = -1.0          # not available from PointStamped source
+        out.x_mm            = float(x) * 1000.0
+        out.y_mm            = float(y) * 1000.0
+        out.z_mm            = float(z) * 1000.0
+        out.confidence      = -1.0
         out.track_id        = -1
         out.detection_mode  = config.DETECTION_MODE
         self._pub_to_matlab.publish(out)
@@ -322,6 +372,76 @@ class MatlabBridgeNode(Node):
         self._fsm.on_matlab_reply(
             msg.theta1_deg, msg.theta2_deg, msg.theta3_deg, msg.ik_valid
         )
+
+    # ── RealSense depth callbacks ─────────────────────────────────────────────
+
+    def _on_depth_image(self, msg: Image) -> None:
+        arr = np.frombuffer(bytes(msg.data), dtype=np.uint16).reshape(msg.height, msg.width)
+        with self._depth_lock:
+            self._depth_image = arr
+
+    def _on_camera_info(self, msg: CameraInfo) -> None:
+        if self._fx is None:
+            self._fx = msg.k[0]
+            self._fy = msg.k[4]
+            self._cx = msg.k[2]
+            self._cy = msg.k[5]
+            self.get_logger().info(
+                f"Camera intrinsics: fx={self._fx:.1f} fy={self._fy:.1f} "
+                f"cx={self._cx:.1f} cy={self._cy:.1f}"
+            )
+
+    def _reproject_with_real_depth(self, x_m: float, y_m: float, z_m: float):
+        """Replace z using real RealSense depth.
+
+        Takes base-frame position in metres from /delta/target_xyz, reverse-
+        projects to image pixel, reads aligned depth at that pixel, then
+        re-deprojects to base frame with the real depth.
+
+        Returns (x_m, y_m, z_real_m) or None if depth is unavailable.
+        """
+        if self._fx is None:
+            return None
+
+        # metres → mm
+        p_b = np.array([x_m * 1000.0, y_m * 1000.0, z_m * 1000.0, 1.0])
+
+        # Base frame → camera frame → pixel
+        p_c = self._T_base_to_cam @ p_b
+        xc, yc, zc = p_c[:3]
+        if zc <= 1.0:
+            return None
+        u = int(round(self._fx * xc / zc + self._cx))
+        v = int(round(self._fy * yc / zc + self._cy))
+
+        # Sample 5×5 window from the aligned depth image
+        with self._depth_lock:
+            depth_img = self._depth_image
+        if depth_img is None:
+            return None
+
+        h, w = depth_img.shape
+        if not (0 <= u < w and 0 <= v < h):
+            self.get_logger().warn(
+                f"Projected pixel ({u},{v}) outside depth image ({w}×{h})"
+            )
+            return None
+
+        r = 2
+        patch = depth_img[
+            max(0, v - r):min(h, v + r + 1),
+            max(0, u - r):min(w, u + r + 1),
+        ].flatten().astype(np.float32)
+        valid = patch[(patch > 1.0) & (patch < 10000.0)]   # 1 mm … 10 m
+        if len(valid) < 3:
+            return None
+
+        z_cam_mm = float(np.median(valid))
+        x_cam_mm = (u - self._cx) * z_cam_mm / self._fx
+        y_cam_mm = (v - self._cy) * z_cam_mm / self._fy
+
+        p_real = self._T_cam_to_base @ np.array([x_cam_mm, y_cam_mm, z_cam_mm, 1.0])
+        return p_real[0] / 1000.0, p_real[1] / 1000.0, p_real[2] / 1000.0
 
     # ── publish helpers ───────────────────────────────────────────────────────
 
