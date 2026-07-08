@@ -33,7 +33,6 @@ from geometry_msgs.msg import PointStamped, PoseArray
 from std_msgs.msg import Float32, String
 
 from delta_common import config
-from delta_common import error_map
 from delta_common.fk_ik import check_workspace, delta_calcInverse, e, f, re, rf
 from delta_motor_controller.motor_controller import DeltaMotorController
 from delta_motor_controller.pneumatic_gripper import PneumaticGripper
@@ -46,13 +45,11 @@ from delta_main_app.belt_predictor import BeltPredictor
 
 APPROACH_Z_OFFSET = 0.0
 LIFT_Z_OFFSET = 30.0
-HOME_X = 0.0
-HOME_Y = 0.0
-HOME_Z = -350.0
+HOME_Z = config.HOME_Z
 
 GRASP_WAIT_SEC = 0.4
 DROP_WAIT_SEC = 0.4
-MOVE_SETTLE_SEC = 0.1
+MOVE_SETTLE_SEC = 0.05
 
 CONFIRM_FRAMES = 2
 STABLE_THRESH_MM = 10.0
@@ -96,12 +93,14 @@ class PickAndPlaceStateMachine:
         gripper_pub,
         state_pub,
         logger,
+        get_next_pick_xy=None,
     ):
         self._ctrl = controller
         self._gripper_pub = gripper_pub
         self._state_pub = state_pub
         self._log = logger
         self._state = "IDLE"
+        self._get_next_pick_xy = get_next_pick_xy
 
         self._recent_xyz = []
         self._target_xyz = None
@@ -109,6 +108,12 @@ class PickAndPlaceStateMachine:
         self._lock = threading.Lock()
         self._ee_error_x = None
         self._ee_error_y = None
+
+    @property
+    def current_pick_x(self):
+        """X of the object currently being picked, or None when idle."""
+        with self._lock:
+            return self._target_xyz[0] if self._target_xyz else None
 
     def detection_update(self, x: float, y: float, z: float) -> None:
         with self._lock:
@@ -154,7 +159,7 @@ class PickAndPlaceStateMachine:
             (0.0, 0.0, -350.0, "home"),
         ):
             # home uses raw platform Z; others are EE-tip Z that need offset conversion
-            cz = cz_ee if label == "home" else cz_ee - ee_off
+            cz = cz_ee if label == "home" else cz_ee + ee_off
             st, t1, t2, t3 = delta_calcInverse(cx, cy, cz, e, f, re, rf)
             if st == 0:
                 self._log.info(
@@ -248,7 +253,7 @@ class PickAndPlaceStateMachine:
         from delta_common.fk_ik import delta_calcInverse, e, f, re, rf
 
         x, y, z = self._target_xyz
-        z_platform = z - config.EE_OFFSET_Z_MM   # EE-tip → platform Z for all moves
+        z_platform = z + config.EE_OFFSET_Z_MM   # EE-tip → platform Z for all moves
         az = _approach_z(z_platform)
         lz = _lift_z(z_platform)
 
@@ -278,10 +283,16 @@ class PickAndPlaceStateMachine:
                 # and adapts automatically to belt speed variation.
                 if config.CONVEYOR_MODE and config.EE_CORRECTION_ENABLE:
                     deadline_arr = time.time() + config.CONVEYOR_ARRIVAL_TIMEOUT_S
+                    no_signal = 0
                     while time.time() < deadline_arr:
                         _, ey = self._wait_fresh_ee_error(timeout=0.1)
                         if ey is None:
-                            break
+                            no_signal += 1
+                            if no_signal >= 5:
+                                self._log.warn("Arrival gate: no EE signal — proceeding")
+                                break
+                            continue
+                        no_signal = 0
                         self._log.info(f"Arrival wait: err_y={ey:+.1f}mm")
                         if abs(ey) < config.CONVEYOR_ARRIVAL_Y_THRESH_MM:
                             self._log.info("Object arrived under EE")
@@ -376,17 +387,40 @@ class PickAndPlaceStateMachine:
         except RuntimeError as exc:
             self._log.error(f"Sequence aborted: {exc}")
             self._gripper(0.0)
+        except Exception as exc:
+            # Non-RuntimeError (e.g. CAN bus exception from bus.read/write) — log
+            # and fall through to finally so _busy is always cleared.
+            self._log.error(f"Unexpected error in sequence: {exc}", exc_info=True)
+            try:
+                self._gripper(0.0)
+            except Exception:
+                pass
 
         finally:
             self._set_state("RESETTING")
-            self._move(HOME_X, HOME_Y, HOME_Z, raw=True)
-            with self._lock:
-                self._state = "IDLE"
-                self._busy = False
-                self._target_xyz = None
-                self._recent_xyz = []
-            self._publish_state()
-            self._log.info("Sequence complete - IDLE")
+            # Pre-position toward the next queued pick instead of going to
+            # (0, 0).  This turns two sequential moves (home then
+            # approach) into a single diagonal move, saving ~0.3–0.4 s.
+            try:
+                next_xy = self._get_next_pick_xy() if self._get_next_pick_xy else None
+                if next_xy:
+                    nx, ny = next_xy
+                    self._log.info(f"Reset: pre-positioning at ({nx:.1f}, {ny:.1f}, {HOME_Z:.0f})")
+                    self._move(nx, ny, HOME_Z, raw=True)
+                else:
+                    ok, fk_xyz, _, _ = self._ctrl.move_thetas(0.0, 0.0, 0.0)   # exact θ=0,0,0 home
+                    if ok and fk_xyz is not None:
+                        self._current_ee_xyz = (fk_xyz[0], fk_xyz[1], fk_xyz[2] - config.EE_OFFSET_Z_MM)
+            except Exception as exc:
+                self._log.error(f"Reset move failed: {exc}")
+            finally:
+                with self._lock:
+                    self._state = "IDLE"
+                    self._busy = False
+                    self._target_xyz = None
+                    self._recent_xyz = []
+                self._publish_state()
+                self._log.info("Sequence complete - IDLE")
 
     def _move(self, x: float, y: float, z: float, raw: bool = False) -> bool:
         from delta_common.fk_ik import delta_calcInverse, e, f, re, rf
@@ -409,7 +443,7 @@ class PickAndPlaceStateMachine:
         ok, _, _, _, err = self._ctrl.move_xyz(x, y, z, raw=raw)
         if ok:
             self._log.info(f"  FK err={err:.2f} mm  OK")
-            self._current_ee_xyz = (x, y, z + config.EE_OFFSET_Z_MM)
+            self._current_ee_xyz = (x, y, z - config.EE_OFFSET_Z_MM)
         else:
             self._log.warn("  Move FAILED")
         return ok
@@ -431,6 +465,7 @@ class DeltaMainApp(Node):
     def __init__(self):
         super().__init__("delta_main_app")
 
+        self._explicit_shutdown = False   # True only on intentional Ctrl+C
         self._ctrl = DeltaMotorController(
             can_port="can0",
             vel_max=config.MOTOR_VEL_MAX,
@@ -455,6 +490,7 @@ class DeltaMainApp(Node):
             gripper_pub=self._send_gripper,
             state_pub=self._send_state,
             logger=self.get_logger(),
+            get_next_pick_xy=self._peek_next_pick_xy,
         )
 
         self._target_queue: list = []
@@ -479,9 +515,16 @@ class DeltaMainApp(Node):
             PointStamped, "/delta/ee_error_mm", self._ee_error_callback, 10
         )
         self._pub_ee_fk = self.create_publisher(PointStamped, "/delta/ee_fk_xyz", 10)
+        self._pub_ff_target = self.create_publisher(
+            PointStamped, "/delta/matlab/target_xyz_mm", 10
+        )
+        self._pub_ff_ee = self.create_publisher(
+            PointStamped, "/delta/matlab/ee_position_mm", 10
+        )
         self._fsm._current_ee_xyz = None
         self.create_timer(0.1, self._queue_timer)
         self.create_timer(0.05, self._publish_ee_fk_timer)
+        self.create_timer(0.05, self._publish_feedforward_timer)
 
         self.get_logger().info(
             f"DeltaMainApp ready  "
@@ -504,6 +547,31 @@ class DeltaMainApp(Node):
         pt.point.z = float(xyz[2])
         self._pub_ee_fk.publish(pt)
 
+    def _publish_feedforward_timer(self) -> None:
+        now = self.get_clock().now().to_msg()
+        tgt = self._fsm._target_xyz
+        if tgt is not None:
+            pt = PointStamped()
+            pt.header.stamp = now
+            pt.header.frame_id = "robot_base"
+            pt.point.x = float(tgt[0])
+            pt.point.y = float(tgt[1])
+            pt.point.z = float(tgt[2])   # EE-tip Z in mm
+            self._pub_ff_target.publish(pt)
+        if config.ENABLE_MOTORS and self._ctrl.connected:
+            try:
+                ok, x, y, z = self._ctrl.get_current_xyz()
+                if ok:
+                    pt = PointStamped()
+                    pt.header.stamp = now
+                    pt.header.frame_id = "robot_base"
+                    pt.point.x = float(x)
+                    pt.point.y = float(y)
+                    pt.point.z = float(z) - config.EE_OFFSET_Z_MM  # platform → EE-tip
+                    self._pub_ff_ee.publish(pt)
+            except Exception as exc:
+                self.get_logger().debug(f"FF EE publish error: {exc}")
+
     def _ee_error_callback(self, msg: PointStamped) -> None:
         alpha = config.EE_CORRECTION_ALPHA
         self._ee_error_x = alpha * msg.point.x + (1.0 - alpha) * self._ee_error_x
@@ -517,27 +585,54 @@ class DeltaMainApp(Node):
         )
 
     def _all_targets_callback(self, msg: PoseArray) -> None:
-        self.get_logger().info(f"GOT all_targets: {len(msg.poses)} poses")
         with self._queue_lock:
-            self.get_logger().info(
-                f"ALL_TARGETS: {len(msg.poses)} poses, "
-                f"fsm={self._fsm.state}, "
-                f"queue={len(self._target_queue)}"
-            )
             candidates = [
                 (p.position.x * 1000.0, p.position.y * 1000.0, p.position.z * 1000.0)
                 for p in msg.poses
             ]
             if not candidates:
                 return
-            candidates.sort(key=lambda p: p[1])  # ascending Y: lowest = most advanced on belt = pick first
-            # Always feed the predictor so the regression window stays populated,
-            # even while the robot is busy or a pick is already queued.
-            self._predictor.update_velocity(candidates[0][1], time.time())
-            if self._fsm.state != "IDLE" or self._target_queue:
+            # Ascending Y: most advanced on belt (closest to exit) first.
+            candidates.sort(key=lambda p: p[1])
+            now = time.time()
+
+            # Always feed the predictor — regression window must stay populated.
+            self._predictor.update_velocity(candidates[0][1], now)
+
+            # Refresh stale queue positions with fresh detections.
+            # Objects move in Y only; match existing queue items by X proximity (±25 mm)
+            # and overwrite their Y + timestamp so extrapolation stays accurate.
+            queued_xs: list = []
+            for i, (qx, _, _, _) in enumerate(self._target_queue):
+                queued_xs.append(qx)
+                for cx, cy, cz in candidates:
+                    if abs(cx - qx) < 25.0:
+                        self._target_queue[i] = (cx, cy, cz, now)
+                        break
+
+            if not self._target_queue:
+                # Queue empty — build from fresh candidates only when IDLE.
+                # While busy the current pick target may still be visible;
+                # rebuilding the queue here would re-dispatch it.
+                if self._fsm.state == "IDLE":
+                    self._target_queue = [(x, y, z, now) for x, y, z in candidates]
+                    self.get_logger().info(f"Queued {len(candidates)} object(s)")
                 return
-            self._target_queue = candidates
-            self.get_logger().info(f"Queued {len(candidates)} target(s)")
+
+            # Queue has items; add any objects newly detected that aren't in it yet,
+            # excluding the one currently being picked.
+            current_x = self._fsm.current_pick_x
+            for cx, cy, cz in candidates:
+                if len(self._target_queue) >= 5:
+                    break
+                if current_x is not None and abs(cx - current_x) < 25.0:
+                    continue  # this is the object currently being picked
+                if all(abs(cx - qx) >= 25.0 for qx in queued_xs):
+                    self._target_queue.append((cx, cy, cz, now))
+                    queued_xs.append(cx)
+                    self.get_logger().info(
+                        f"New object added to queue: ({cx:.1f}, {cy:.1f})"
+                    )
 
     def _velocity_callback(self, msg: PointStamped) -> None:
         self._belt_vy_mm_s = msg.point.y
@@ -546,16 +641,40 @@ class DeltaMainApp(Node):
         if self._homing:
             return
         with self._queue_lock:
-            if self._fsm.state == "IDLE" and self._target_queue:
-                self.get_logger().info(
-                    f"QUEUE_TIMER: processing target "
-                    f"({self._target_queue[0][0]:.1f}, "
-                    f"{self._target_queue[0][1]:.1f}, "
-                    f"{self._target_queue[0][2]:.1f})"
-                )
             if self._fsm.state != "IDLE" or not self._target_queue:
                 return
-            x, y, z = self._target_queue.pop(0)
+
+            now = time.time()
+            vy = self._predictor.measured_vy
+            if vy is None:
+                vy = -config.CONVEYOR_BELT_SPEED_MM_S
+
+            # Extrapolate every queued item's Y to "now" using the belt velocity
+            # estimate, then drop any that have already passed through the workspace.
+            fresh = []
+            for qx, qy, qz, qt in self._target_queue:
+                y_now = qy + vy * (now - qt)
+                if y_now < -(config.Y_LIMIT + 20.0):
+                    self.get_logger().warn(
+                        f"Object X={qx:.1f}mm exited workspace "
+                        f"(y_extrap={y_now:.1f}mm) — dropped"
+                    )
+                    continue
+                fresh.append((qx, y_now, qz, now))
+
+            # Re-sort: most advanced (lowest Y) first.
+            fresh.sort(key=lambda p: p[1])
+            self._target_queue = fresh
+
+            if not self._target_queue:
+                return
+
+            x, y, z, _ = self._target_queue.pop(0)
+
+            self.get_logger().info(
+                f"QUEUE_TIMER: dispatching ({x:.1f}, {y:.1f}, {z:.1f})  "
+                f"queue_remaining={len(self._target_queue)}"
+            )
 
             result = self._predictor.predict(x, y)
             x_pick = x
@@ -574,25 +693,20 @@ class DeltaMainApp(Node):
                         f"Predicted pick ({x:.1f}, {result.y_pick:.1f}) outside workspace — skipped"
                     )
                     return
-            elif not check_workspace(x, y_pick, z - config.EE_OFFSET_Z_MM):
+            elif not check_workspace(x, y_pick, z + config.EE_OFFSET_Z_MM):
                 self.get_logger().warn(
                     f"Predicted pick ({x:.1f}, {y_pick:.1f}, {z:.1f}) outside workspace — skipped"
                 )
                 return
-            if config.ERROR_MAP_ENABLE:
-                dx, dy, _ = error_map.correction(x_pick, y_pick, z, config.ERROR_MAP_FILE)
-                x_pick -= dx
-                y_pick -= dy
-                self.get_logger().info(
-                    f"Error map correction: dx={dx:.1f} dy={dy:.1f} mm"
-                )
             self.get_logger().info(
                 f"Pre-position target: ({x_pick:.1f}, {y_pick:.1f}, {z:.1f}) mm  "
                 f"vy={result.vy_mm_s:.1f} mm/s  offset={result.belt_offset:.1f} mm  "
                 f"t={result.t_total:.2f} s"
             )
             self._check_belt_verify()
-            self._fsm.force_target(x_pick, y_pick, z)
+            if not self._fsm.force_target(x_pick, y_pick, z):
+                self._target_queue.insert(0, (x, y, z, now))
+                self.get_logger().warn("force_target busy — item re-queued")
 
     def _status_callback(self, msg: String) -> None:
         if "NO_DETECTION" in msg.data or "LOST" in msg.data:
@@ -603,7 +717,7 @@ class DeltaMainApp(Node):
         m.data = float(pos)
         self._gripper_pub.publish(m)
         if config.ENABLE_MOTORS:
-            if pos > 0.5:
+            if pos > 0.3:
                 self._gripper.grip(wait=False)
             else:
                 self._gripper.release(wait=False)
@@ -655,26 +769,46 @@ class DeltaMainApp(Node):
         else:
             self.get_logger().info(msg)
 
+    def _peek_next_pick_xy(self):
+        """Return (x, y_predicted) of the next queued object, or None.
+        Called by the FSM during RESETTING so it can pre-position toward the
+        next pick instead of returning to the centre home position."""
+        with self._queue_lock:
+            if not self._target_queue:
+                return None
+            qx, qy, _, qt = self._target_queue[0]
+            vy = self._predictor.measured_vy or -config.CONVEYOR_BELT_SPEED_MM_S
+            y_now = qy + vy * (time.time() - qt)
+            result = self._predictor.predict(qx, y_now)
+            # Clamp to workspace so the IK always succeeds for the pre-position move.
+            x_pre = max(-config.X_LIMIT + 5.0, min(config.X_LIMIT - 5.0, qx))
+            y_pre = max(-config.Y_LIMIT + 5.0, min(config.Y_LIMIT - 5.0, result.y_pick))
+            return (x_pre, y_pre)
+
     def _startup_home(self) -> None:
         time.sleep(0.5)
         self.get_logger().info("Startup: opening gripper and homing to workspace center")
         self._send_gripper(0.0)          # open gripper
-        if config.ENABLE_MOTORS:
-            self._ctrl.move_xyz(HOME_X, HOME_Y, HOME_Z, raw=True)
-        self._homing = False             # allow picks once arm is at home
+        try:
+            if config.ENABLE_MOTORS:
+                self._ctrl.move_thetas(0.0, 0.0, 0.0)   # exact θ=0,0,0 home
+        except Exception as exc:
+            self.get_logger().error(f"Startup home failed: {exc}")
+        finally:
+            self._homing = False         # always allow picks — better to try than freeze
 
     def destroy_node(self) -> None:
         self._homing = True              # stop new picks immediately
-        self._send_gripper(0.0)          # open gripper (ROS + direct CAN)
-        if config.ENABLE_MOTORS:
-            try:
-                self._ctrl.move_xyz(HOME_X, HOME_Y, HOME_Z, raw=True)
-                time.sleep(0.5)
-            except Exception:
-                pass
-            self._ctrl.shutdown()
-        if config.ENABLE_MOTORS:
-            self._gripper.disconnect()   # explicit release + close bus before GC
+        if self._explicit_shutdown:
+            self._send_gripper(0.0)      # open gripper (ROS + direct CAN)
+            if config.ENABLE_MOTORS:
+                try:
+                    self._ctrl.move_thetas(0.0, 0.0, 0.0)   # exact θ=0,0,0 home
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+                self._ctrl.shutdown()
+                self._gripper.disconnect()
         super().destroy_node()
 
 
@@ -685,6 +819,7 @@ def main(args=None):
 
     def handle_sigint(*_):
         node.get_logger().info("Ctrl+C received — shutting down cleanly")
+        node._explicit_shutdown = True
         node.destroy_node()
         rclpy.shutdown()
 

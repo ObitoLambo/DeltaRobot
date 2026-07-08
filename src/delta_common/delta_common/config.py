@@ -162,17 +162,21 @@ DEPTH_MAD_SCALE = 2.0
 DEPTH_HISTORY_SIZE = 7
 DEPTH_MAX_JUMP_M = 0.015
 
-# Home position — workspace centre, mid-height
+# Home position — θ1=θ2=θ3=0° exactly (arms horizontal). Actual homing goes
+# through move_thetas(0,0,0), bypassing IK; this Z is FK(0,0,0) for reference
+# only (e.g. pre-position height, logging). delta_calcForward(0,0,0,...) = -323.531mm.
 HOME_X =   0.0
 HOME_Y =   0.0
-HOME_Z = -350.0
+HOME_Z = -323.531
 
 # Drop at belt exit edge — Y = -150mm
 PLACE_X =  150.0
 PLACE_Y = -150.0
 
-PLACE_Z = -460.0   # wrist Z for place  (EE tip = PLACE_Z - 150 = -610mm, 40mm above belt)
-PICK_Z  = -470.0   # wrist Z for pick   (EE tip = PICK_Z  - 150 = -620mm, 30mm above belt)
+PLACE_Z = -483.5   # wrist Z for place  (EE tip = PLACE_Z - 150 = -633.5mm, 30mm above belt@-663.5)
+PICK_Z  = -483.5   # wrist Z for pick   (EE tip = PICK_Z  - 150 = -633.5mm, 30mm above belt@-663.5)
+# Tip target -633.5mm is only 4.5mm above EETIP_Z_FLOOR_MM(-638.0, confirmed crash) — verify
+# with a slow manual descent before running full-speed automated cycles.
 
 # Acceleration used for triangular travel-time prediction (medium preset).
 # Within ±150mm workspace all moves are triangular: t = 2*sqrt(dist / TRAJ_A_MAX_MM_S2)
@@ -190,15 +194,15 @@ CONVEYOR_ARRIVAL_TIMEOUT_S   = 5.0   # give up and pick anyway after 5s
 # +X, set EE_OFFSET_X_MM = -10.0.
 EE_OFFSET_X_MM = 0.0
 EE_OFFSET_Y_MM = 0.0
-EE_OFFSET_Z_MM   = -60.0  # camera now reports platform Z directly via FAKE_DEPTH_M=0.650
+EE_OFFSET_Z_MM   = 150.0   # gripper length below platform (mm); tip = platform - 150, platform = tip + 150
 
 FAKE_DEPTH_ENABLE = True
-FAKE_DEPTH_M = 0.650      # fixed camera-to-belt distance (m); tune if belt Z drifts
+FAKE_DEPTH_M = 0.620       # camera-to-belt distance (m), measured directly → z_base=-675mm, z_platform=-525mm
 
 ERROR_MAP_ENABLE = False
 
-MOTOR_VEL_MAX    = 3.0   # PP mode max velocity — increase for faster moves (was 1.0)
-MOTOR_ACC_SET    = 5.0   # PP mode acceleration — increase for snappier starts (was 2.0)
+MOTOR_VEL_MAX    = 25.0  # PP mode max velocity — increase for faster moves (was 3.0; motor spec max 50)
+MOTOR_ACC_SET    = 30.0  # PP mode acceleration — increase for snappier starts (was 5.0)
 FK_VERIFY_TOL_MM = 3.0
 PRINT_COOLDOWN_SEC = 1.0
 FAKE_MOVE_COOLDOWN_SEC = 1.0
@@ -207,8 +211,11 @@ ENABLE_MOTORS = True
 MOVE_COOLDOWN_SEC = 1.5
 MOVE_THRESHOLD_MM = 4.0
 
-# z_base = -530 + CAM_TZ_MM(-20) = -550mm = belt surface
-# z_platform = -550 - EE_OFFSET_Z_MM(-60) = -490mm
+# Measured 2026-07-01 at true θ=0,0,0 home: base_to_plate=320mm (FK predicts 323.5mm,
+# model validated), plate_to_tip=150mm (fixed), tip_to_belt=190mm.
+# home tip Z (FK) = -473.531mm
+# z_base = home_tip_Z - tip_to_belt(190) = -663.531mm = belt surface (tip frame)
+# z_platform = z_base + EE_OFFSET_Z_MM(150) = -513.531mm = belt surface (wrist/platform frame)
 
 # Fixed fake object position for testing EE correction
 # Set FAKE_OBJ_ENABLE = True to use fixed position
@@ -237,13 +244,13 @@ CONVEYOR_VY_MIN_MM_S =  1.0    # below this → belt probably stopped, use 0
 CONVEYOR_VY_MAX_MM_S = 25.0    # above this → regression outlier, clamp to design speed
 
 # Minimum seconds between consecutive target publishes to avoid flooding the robot.
-TARGET_PUBLISH_COOLDOWN_SEC = 3.0
+TARGET_PUBLISH_COOLDOWN_SEC = 1.0
 
 # Camera-frame workspace zone overlay.
 # Projects the robot reachable square (±X_LIMIT, ±Y_LIMIT) at WORKSPACE_PICK_Z_MM
 # and draws three coloured zones: approach (amber), workspace (green), exit (red).
 DRAW_WORKSPACE_ZONES = True
-WORKSPACE_PICK_Z_MM  = -490.0   # platform Z at pick height (EE tip 150mm below = belt)
+WORKSPACE_PICK_Z_MM  = -513.5   # platform Z at pick height (EE tip 150mm below = belt)
 
 # EE marker detection (white laser dot on end-effector tip)
 EE_CORRECTION_ENABLE    = True
@@ -289,9 +296,9 @@ CAMERA_DIRECT_MATRIX = (
 CAM_FINE_ROLL_DEG  = 0.0
 CAM_FINE_PITCH_DEG = 0.0
 CAM_FINE_YAW_DEG   = 0.0
-CAM_TX_MM =  -10.0   # tuning — adjust in ±10mm steps until green box centres under arm
-CAM_TY_MM = 235.0    # calculated: EE dot at y=38px (exit Y=-150mm) → crosshair at 161px → T_Y=96≈100mm
-CAM_TZ_MM =  -20.0   # measured: camera is 20 mm below base frame origin
+CAM_TX_MM =  -15.0   # tuning — adjust in ±10mm steps until green box centres under arm
+CAM_TY_MM = 233.0    # calibrated: object at actual y=113mm detected as y=65mm → +48mm correction
+CAM_TZ_MM =  -43.5   # derived: belt tip Z(-663.5) + cam_to_belt(620) = camera is 43.5mm below base frame origin
 
 # Full 4×4 homogeneous T_cam_to_base  (p_base = T @ [p_cam; 1])
 # Built from the R and t above — use camera_system._build_T_cam_to_base() at runtime
@@ -304,7 +311,7 @@ CAMERA_T_BASE = (
 
 X_LIMIT = 150.0   # rectangular pre-filter; IK in check_workspace rejects unreachable corners
 Y_LIMIT = 150.0
-Z_MIN = -560.0
+Z_MIN = -650.0
 # Actual IK ceiling at centre: -sqrt(re^2 - (rf + (f-e)*tan30/2)^2) ≈ -323.5 mm.
 # The old value (-196.875) was geometrically wrong; any Z above -323 fails IK.
 Z_MAX = -323.0

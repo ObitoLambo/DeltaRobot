@@ -40,7 +40,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument("align_depth_enable", default_value="false"),
+        DeclareLaunchArgument("align_depth_enable", default_value="true"),
         DeclareLaunchArgument("color_profile",      default_value="640x480x30"),
         DeclareLaunchArgument("depth_profile",      default_value="424x240x6"),
         DeclareLaunchArgument("enable_accel",       default_value="false"),

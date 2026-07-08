@@ -44,6 +44,18 @@ class BeltPredictor:
 
     def update_velocity(self, y_mm: float, timestamp: float) -> None:
         """Record a new Y observation. Call on every detection frame."""
+        # If Y jumped beyond what belt physics allow, the tracked object changed
+        # (previous one was picked). Stale samples from the old object would corrupt
+        # the velocity regression — discard them before adding the new reading.
+        if self._samples:
+            last_y = self._samples[-1][1]
+            dt = max(timestamp - self._samples[-1][0], 0.0)
+            # Belt only moves in -Y.  Clear window if Y jumped in the wrong
+            # direction (+Y) or moved more than physically possible in -Y.
+            # 5 mm tolerance absorbs camera noise on the same object.
+            if (y_mm > last_y + 5.0 or
+                    y_mm < last_y - config.CONVEYOR_VY_MAX_MM_S * dt - 5.0):
+                self._samples.clear()
         self._samples.append((timestamp, y_mm))
         cutoff = timestamp - _WINDOW_S
         self._samples = [(t, y) for t, y in self._samples if t >= cutoff]

@@ -1,0 +1,1320 @@
+================================================================================
+APPENDIX C   SOURCE CODE LISTINGS
+================================================================================
+
+The following appendix provides the complete Python source code for the key
+software components of the Delta robot pick-and-place system.
+
+
+────────────────────────────────────────────────────────────────────────────────
+C.1  Motor Calibration GUI
+────────────────────────────────────────────────────────────────────────────────
+
+The following Python script implements the motor calibration graphical user
+interface (GUI) used to home and configure the motor drivers of the Delta robot
+via CAN bus communication.  The GUI is built with the standard Tkinter library
+and communicates with three RobStride RS-00 motors over SocketCAN (1 Mbit/s).
+Key functions include connecting to the CAN bus, setting Position-Profile (PP)
+mode velocity and acceleration parameters, commanding individual joint angles
+with built-in joint-limit safety checks, and reading back live encoder positions
+at 10 Hz.  All CAN I/O runs in daemon threads so the graphical interface remains
+responsive at all times.
+
+File: src/delta_motor_controller/delta_motor_controller/motor_calibration_gui.py
+
+#!/usr/bin/env python3
+"""
+motor_calibration_gui.py -- Motor Calibration GUI for the Delta Robot.
+
+Tkinter graphical tool for homing and configuring the three RobStride RS-00
+motor drivers via CAN bus (SocketCAN, 1 Mbit/s).
+
+Features:
+    - Connect / Disconnect to CAN bus
+    - Enable / Disable all motors
+    - Home all motors to 0 degrees
+    - Set individual motor joint-angle targets with joint-limit safety check
+    - Configure PP-mode velocity and acceleration
+    - Live position readback from motor encoders at 10 Hz
+
+Usage:
+    python3 motor_calibration_gui.py
+"""
+
+import math
+import threading
+import time
+import tkinter as tk
+from tkinter import messagebox, ttk
+
+try:
+    from robstride_dynamics import Motor, ParameterType, RobstrideBus
+except ImportError:
+    from bus import RobstrideBus, Motor
+    from protocol import ParameterType
+
+from delta_common import config
+
+# -- Hardware constants -------------------------------------------------------
+
+CAN_PORT    = "can0"
+MOTOR_IDS   = [1, 2, 3]
+MOTOR_NAMES = [f"motor_{i}" for i in MOTOR_IDS]
+THETA_MIN   = config.THETA1_MIN   # degrees (shared for all three arms)
+THETA_MAX   = config.THETA1_MAX
+POLL_HZ     = 10                  # live readback rate
+
+
+class MotorCalibrationGUI:
+    """
+    Main application window.
+
+    All CAN I/O runs in daemon threads; GUI updates are marshalled back to
+    the Tk event loop via root.after() so the UI stays responsive.
+    """
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("Delta Robot -- Motor Calibration")
+        self.root.resizable(False, False)
+
+        self.bus = None
+        self.connected = False
+        self._lock = threading.Lock()
+        self._poll_running = False
+
+        self._build_ui()
+
+    # -- UI construction ------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        PAD = {"padx": 8, "pady": 4}
+
+        # -- CAN connection ---------------------------------------------------
+        conn = ttk.LabelFrame(self.root, text="CAN Connection", padding=6)
+        conn.grid(row=0, column=0, columnspan=3, sticky="ew", **PAD)
+
+        ttk.Label(conn, text="Channel:").grid(row=0, column=0, sticky="w")
+        self._channel_var = tk.StringVar(value=CAN_PORT)
+        ttk.Entry(conn, textvariable=self._channel_var, width=10).grid(
+            row=0, column=1, padx=4
+        )
+        self._btn_connect = ttk.Button(conn, text="Connect", command=self._connect)
+        self._btn_connect.grid(row=0, column=2, padx=4)
+        self._btn_disconnect = ttk.Button(
+            conn, text="Disconnect", command=self._disconnect, state="disabled"
+        )
+        self._btn_disconnect.grid(row=0, column=3, padx=4)
+
+        # -- PP-mode settings -------------------------------------------------
+        pp = ttk.LabelFrame(self.root, text="PP Mode Settings", padding=6)
+        pp.grid(row=1, column=0, columnspan=3, sticky="ew", **PAD)
+
+        ttk.Label(pp, text="Velocity max (rad/s):").grid(row=0, column=0, sticky="w")
+        self._vel_var = tk.StringVar(value=str(config.MOTOR_VEL_MAX))
+        ttk.Entry(pp, textvariable=self._vel_var, width=8).grid(row=0, column=1)
+
+        ttk.Label(pp, text="Acceleration (rad/s^2):").grid(
+            row=1, column=0, sticky="w", pady=2
+        )
+        self._acc_var = tk.StringVar(value=str(config.MOTOR_ACC_SET))
+        ttk.Entry(pp, textvariable=self._acc_var, width=8).grid(row=1, column=1)
+
+        ttk.Button(pp, text="Apply", command=self._apply_pp_settings).grid(
+            row=0, column=2, rowspan=2, padx=8
+        )
+
+        # -- Per-motor controls -----------------------------------------------
+        motors = ttk.LabelFrame(self.root, text="Motor Control", padding=6)
+        motors.grid(row=2, column=0, columnspan=3, sticky="ew", **PAD)
+
+        for col, header in enumerate(["Motor", "Target (deg)", "Set", "Position (deg)"]):
+            ttk.Label(motors, text=header, font=("", 9, "bold")).grid(
+                row=0, column=col, padx=6, pady=2
+            )
+
+        self._target_vars = []
+        self._pos_labels = []
+
+        for i, (mid, name) in enumerate(zip(MOTOR_IDS, MOTOR_NAMES)):
+            row = i + 1
+            ttk.Label(motors, text=f"Motor {mid}").grid(row=row, column=0, padx=6, pady=3)
+
+            tv = tk.StringVar(value="0.0")
+            self._target_vars.append(tv)
+            ttk.Entry(motors, textvariable=tv, width=8).grid(row=row, column=1, padx=4)
+
+            ttk.Button(
+                motors,
+                text="Set",
+                command=lambda n=name, v=tv: self._set_angle(n, v),
+            ).grid(row=row, column=2, padx=4)
+
+            lbl = ttk.Label(motors, text="--", width=10)
+            lbl.grid(row=row, column=3, padx=6)
+            self._pos_labels.append(lbl)
+
+        # -- Global action buttons --------------------------------------------
+        act = ttk.Frame(self.root, padding=6)
+        act.grid(row=3, column=0, columnspan=3, **PAD)
+
+        for col, (label, cmd) in enumerate([
+            ("Home All",    self._home_all),
+            ("Enable All",  self._enable_all),
+            ("Disable All", self._disable_all),
+        ]):
+            ttk.Button(act, text=label, command=cmd, width=14).grid(
+                row=0, column=col, padx=6
+            )
+
+        # -- Status bar -------------------------------------------------------
+        self._status_var = tk.StringVar(value="Disconnected")
+        ttk.Label(
+            self.root,
+            textvariable=self._status_var,
+            relief="sunken",
+            anchor="w",
+            padding=(4, 2),
+        ).grid(
+            row=4, column=0, columnspan=3, padx=8, pady=(0, 6), sticky="ew"
+        )
+
+        self.root.columnconfigure(0, weight=1)
+
+    # -- CAN lifecycle --------------------------------------------------------
+
+    def _connect(self) -> None:
+        channel = self._channel_var.get().strip()
+        try:
+            vel = float(self._vel_var.get())
+            acc = float(self._acc_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid velocity or acceleration value.")
+            return
+
+        self._status_var.set(f"Connecting to {channel}...")
+
+        def _worker() -> None:
+            try:
+                motors = {
+                    name: Motor(id=mid, model="rs-00")
+                    for name, mid in zip(MOTOR_NAMES, MOTOR_IDS)
+                }
+                calib = {
+                    name: {"direction": 1, "homing_offset": 0.0}
+                    for name in MOTOR_NAMES
+                }
+                bus = RobstrideBus(channel, motors, calib)
+                bus.connect(handshake=False)
+
+                for name in MOTOR_NAMES:
+                    bus.write(name, ParameterType.MODE, 1)
+                    bus.write(name, ParameterType.PP_VELOCITY_MAX, float(vel))
+                    bus.write(name, ParameterType.PP_ACCELERATION_TARGET, float(acc))
+                    bus.enable(name)
+                    time.sleep(0.05)
+
+                with self._lock:
+                    self.bus = bus
+                    self.connected = True
+
+                self.root.after(0, self._on_connected)
+                self._start_poll()
+
+            except Exception as exc:
+                self.root.after(
+                    0, lambda: self._status_var.set(f"Connection failed: {exc}")
+                )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _disconnect(self) -> None:
+        self._poll_running = False
+
+        def _worker() -> None:
+            with self._lock:
+                if self.bus:
+                    try:
+                        for name in MOTOR_NAMES:
+                            self.bus.write(name, ParameterType.POSITION_TARGET, 0.0)
+                        time.sleep(0.3)
+                        for name in MOTOR_NAMES:
+                            self.bus.disable(name)
+                        self.bus.disconnect(disable_torque=True)
+                    except Exception:
+                        pass
+                    self.bus = None
+                    self.connected = False
+            self.root.after(0, self._on_disconnected)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_connected(self) -> None:
+        self._btn_connect.config(state="disabled")
+        self._btn_disconnect.config(state="normal")
+        self._status_var.set(
+            f"Connected -- {self._channel_var.get()} -- 3 motors active"
+        )
+
+    def _on_disconnected(self) -> None:
+        self._btn_connect.config(state="normal")
+        self._btn_disconnect.config(state="disabled")
+        for lbl in self._pos_labels:
+            lbl.config(text="--")
+        self._status_var.set("Disconnected")
+
+    # -- Motor commands -------------------------------------------------------
+
+    def _apply_pp_settings(self) -> None:
+        try:
+            vel = float(self._vel_var.get())
+            acc = float(self._acc_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid velocity or acceleration value.")
+            return
+
+        def _worker() -> None:
+            with self._lock:
+                if not self.connected:
+                    return
+                for name in MOTOR_NAMES:
+                    self.bus.write(name, ParameterType.PP_VELOCITY_MAX, float(vel))
+                    self.bus.write(name, ParameterType.PP_ACCELERATION_TARGET, float(acc))
+            self.root.after(
+                0,
+                lambda: self._status_var.set(
+                    f"PP settings applied: vel={vel} rad/s  acc={acc} rad/s^2"
+                ),
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _set_angle(self, motor_name: str, var: tk.StringVar) -> None:
+        try:
+            angle_deg = float(var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Enter a numeric angle in degrees.")
+            return
+
+        if not (THETA_MIN <= angle_deg <= THETA_MAX):
+            messagebox.showerror(
+                "Joint Limit",
+                f"Angle {angle_deg:.1f} deg is outside the safe range "
+                f"[{THETA_MIN} deg, {THETA_MAX} deg].",
+            )
+            return
+
+        rad = math.radians(angle_deg)
+
+        def _worker() -> None:
+            with self._lock:
+                if not self.connected:
+                    return
+                self.bus.write(motor_name, ParameterType.POSITION_TARGET, float(rad))
+            self.root.after(
+                0,
+                lambda: self._status_var.set(
+                    f"{motor_name}: target -> {angle_deg:.1f} deg"
+                ),
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _home_all(self) -> None:
+        def _worker() -> None:
+            with self._lock:
+                if not self.connected:
+                    return
+                for name in MOTOR_NAMES:
+                    self.bus.write(name, ParameterType.POSITION_TARGET, 0.0)
+                time.sleep(1.0)
+            self.root.after(
+                0, lambda: self._status_var.set("All motors homed to 0 deg")
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _enable_all(self) -> None:
+        def _worker() -> None:
+            with self._lock:
+                if not self.connected:
+                    return
+                for name in MOTOR_NAMES:
+                    self.bus.enable(name)
+                    time.sleep(0.05)
+            self.root.after(
+                0, lambda: self._status_var.set("All motors enabled")
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _disable_all(self) -> None:
+        def _worker() -> None:
+            with self._lock:
+                if not self.connected:
+                    return
+                for name in MOTOR_NAMES:
+                    self.bus.disable(name)
+                    time.sleep(0.05)
+            self.root.after(
+                0, lambda: self._status_var.set("All motors disabled")
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # -- Live position readback -----------------------------------------------
+
+    def _start_poll(self) -> None:
+        self._poll_running = True
+        threading.Thread(target=self._poll_loop, daemon=True).start()
+
+    def _poll_loop(self) -> None:
+        interval = 1.0 / POLL_HZ
+        while self._poll_running:
+            positions = []
+            with self._lock:
+                if not self.connected:
+                    break
+                for name in MOTOR_NAMES:
+                    try:
+                        rad = float(
+                            self.bus.read(name, ParameterType.MECHANICAL_POSITION)
+                        )
+                        positions.append(math.degrees(rad))
+                    except Exception:
+                        positions.append(None)
+
+            for lbl, pos in zip(self._pos_labels, positions):
+                text = f"{pos:.2f} deg" if pos is not None else "err"
+                self.root.after(0, lambda lb=lbl, t=text: lb.config(text=t))
+
+            time.sleep(interval)
+
+
+def main() -> None:
+    root = tk.Tk()
+    MotorCalibrationGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
+
+────────────────────────────────────────────────────────────────────────────────
+C.2  Kinematics Implementation
+────────────────────────────────────────────────────────────────────────────────
+
+The following module implements the closed-form forward and inverse kinematics
+for the Delta parallel robot.  The delta_calcForward function solves the forward
+kinematics, mapping three joint angles (theta1, theta2, theta3) to the
+Cartesian end-effector position (x, y, z).  The delta_calcInverse function
+solves the inverse kinematics by decomposing the problem into three independent
+planar angle problems via the helper _delta_calcAngleYZ, each rotated 120 deg
+apart about the vertical axis.  All computations use the standard geometric
+model with base radius f = 157 mm, end-effector radius e = 35 mm,
+bicep length rf = 200 mm, and forearm length re = 400 mm.
+A workspace feasibility helper check_workspace is also provided.
+
+File: src/delta_common/delta_common/fk_ik.py
+
+import math
+
+e  = 35.0
+f  = 157.0
+re = 400.0
+rf = 200.0
+
+
+def delta_calcForward(theta1, theta2, theta3, e, f, re, rf):
+    """Forward kinematics: (theta1, theta2, theta3) -> (x0, y0, z0).
+    Returns (status, x, y, z).  status=0 OK, -1 non-existing position.
+    """
+    sqrt3  = math.sqrt(3.0)
+    sin120 = sqrt3 / 2.0
+    cos120 = -0.5
+    tan60  = sqrt3
+    sin30  = 0.5
+    tan30  = 1.0 / sqrt3
+
+    t   = (f - e) * tan30 / 2.0
+    dtr = math.pi / 180.0
+
+    th1 = theta1 * dtr
+    th2 = theta2 * dtr
+    th3 = theta3 * dtr
+
+    y1 = -(t + rf * math.cos(th1))
+    z1 = -rf * math.sin(th1)
+
+    y2 = (t + rf * math.cos(th2)) * sin30
+    x2 = y2 * tan60
+    z2 = -rf * math.sin(th2)
+
+    y3 = (t + rf * math.cos(th3)) * sin30
+    x3 = -y3 * tan60
+    z3 = -rf * math.sin(th3)
+
+    dnm = (y2 - y1) * x3 - (y3 - y1) * x2
+
+    w1 = y1 * y1 + z1 * z1
+    w2 = x2 * x2 + y2 * y2 + z2 * z2
+    w3 = x3 * x3 + y3 * y3 + z3 * z3
+
+    a1 = (z2 - z1) * (y3 - y1) - (z3 - z1) * (y2 - y1)
+    b1 = -((w2 - w1) * (y3 - y1) - (w3 - w1) * (y2 - y1)) / 2.0
+
+    a2 = -(z2 - z1) * x3 + (z3 - z1) * x2
+    b2 = ((w2 - w1) * x3 - (w3 - w1) * x2) / 2.0
+
+    a = a1 * a1 + a2 * a2 + dnm * dnm
+    b = 2.0 * (a1 * b1 + a2 * (b2 - y1 * dnm) - z1 * dnm * dnm)
+    c = (b1 * b1 + (b2 - y1 * dnm) ** 2 + dnm * dnm * (z1 * z1 - re * re))
+
+    d = b * b - 4.0 * a * c
+    if d < 0.0:
+        return -1, 0.0, 0.0, 0.0
+
+    z0 = -0.5 * (b + math.sqrt(d)) / a
+    x0 = (a1 * z0 + b1) / dnm
+    y0 = (a2 * z0 + b2) / dnm
+    return 0, x0, y0, z0
+
+
+def _delta_calcAngleYZ(x0, y0, z0, e, f, re, rf):
+    """Helper: solve IK for one arm in the YZ plane."""
+    tan30 = 1.0 / math.sqrt(3.0)
+
+    y1 = -0.5 * tan30 * f
+    y0 -= 0.5 * tan30 * e
+
+    a = (x0 * x0 + y0 * y0 + z0 * z0 + rf * rf - re * re - y1 * y1) / (2.0 * z0)
+    b = (y1 - y0) / z0
+
+    d = -(a + b * y1) ** 2 + rf * (b * b * rf + rf)
+    if d < 0.0:
+        return -1, 0.0
+
+    yj = (y1 - a * b - math.sqrt(d)) / (b * b + 1.0)
+    zj = a + b * yj
+    theta = math.degrees(math.atan2(-zj, (y1 - yj)))
+    if yj > y1:
+        theta += 180.0
+    return 0, theta
+
+
+def delta_calcInverse(x0, y0, z0, e, f, re, rf):
+    """Inverse kinematics: (x0, y0, z0) -> (theta1, theta2, theta3).
+    Returns (status, t1, t2, t3).  status=0 OK, -1 no solution.
+    """
+    sqrt3  = math.sqrt(3.0)
+    sin120 = sqrt3 / 2.0
+    cos120 = -0.5
+
+    status, theta1 = _delta_calcAngleYZ(x0, y0, z0, e, f, re, rf)
+    if status != 0:
+        return -1, 0.0, 0.0, 0.0
+
+    status, theta2 = _delta_calcAngleYZ(
+        x0 * cos120 + y0 * sin120,
+        y0 * cos120 - x0 * sin120,
+        z0, e, f, re, rf,
+    )
+    if status != 0:
+        return -1, 0.0, 0.0, 0.0
+
+    status, theta3 = _delta_calcAngleYZ(
+        x0 * cos120 - y0 * sin120,
+        y0 * cos120 + x0 * sin120,
+        z0, e, f, re, rf,
+    )
+    if status != 0:
+        return -1, 0.0, 0.0, 0.0
+
+    if theta1 < 0.0 or theta2 < 0.0 or theta3 < 0.0:
+        return -1, 0.0, 0.0, 0.0
+
+    return 0, theta1, theta2, theta3
+
+
+def check_workspace(x_mm: float, y_mm: float, z_mm: float) -> bool:
+    """Return True if (x, y, z) in mm is within the configured robot workspace.
+
+    The bounding box (X_LIMIT / Y_LIMIT / Z_MIN / Z_MAX) is a rectangular
+    over-approximation.  Corners of the box (large XY + Z near ceiling) are
+    outside the actual reachable sphere, so IK feasibility is also verified.
+    """
+    from delta_common import config
+
+    if not (
+        abs(x_mm) <= config.X_LIMIT
+        and abs(y_mm) <= config.Y_LIMIT
+        and config.Z_MIN <= z_mm <= config.Z_MAX
+    ):
+        return False
+    st, _, _, _ = delta_calcInverse(x_mm, y_mm, z_mm, e, f, re, rf)
+    return st == 0
+
+
+────────────────────────────────────────────────────────────────────────────────
+C.3  Trajectory Generation
+────────────────────────────────────────────────────────────────────────────────
+
+The following module implements Cartesian straight-line trajectory planning
+using a symmetric trapezoidal velocity profile.  The profile consists of three
+phases: constant acceleration to a cruise velocity, constant cruise, and
+symmetric deceleration to rest.  When the total path distance is too short to
+reach the cruise velocity, the profile collapses to a triangular shape with a
+lower peak speed.  The public function linear_waypoints samples the
+arc-length profile at fixed time steps and interpolates (x, y, z) waypoints
+along the straight line from the start to the end point.
+
+File: src/delta_common/delta_common/trajectory.py
+
+#!/usr/bin/env python3
+"""
+trajectory.py -- Cartesian trajectory planning for the delta robot.
+
+Generates straight-line Cartesian waypoints between two 3D points using
+a symmetric trapezoidal velocity profile (accelerate -> cruise -> decelerate).
+
+    velocity
+      ^
+      |   ___________
+      |  /           \
+      | /             \
+      |/               \
+      +--+---+-------+--+--> time
+         t_a         T-t_a  T
+
+    Phase 1  [0, t_a]       : constant acceleration a_max -> reach v_max
+    Phase 2  [t_a, T-t_a]   : cruise at v_max
+    Phase 3  [T-t_a, T]     : constant deceleration a_max -> stop
+
+If 2*d_accel >= distance the profile collapses to a triangle (no cruise phase)
+and the peak speed is limited to sqrt(distance * a_max).
+"""
+
+import math
+from typing import List, Tuple
+
+Point3D = Tuple[float, float, float]
+
+
+def _trapezoidal_distances(
+    distance: float,
+    v_max: float,
+    a_max: float,
+    dt: float,
+) -> List[float]:
+    """Return cumulative arc-length values (mm) sampled at fixed time steps dt.
+
+    Parameters
+    ----------
+    distance : total path length in mm (must be > 0)
+    v_max    : maximum cruise velocity in mm/s
+    a_max    : maximum acceleration / deceleration in mm/s^2
+    dt       : control-loop period in seconds
+
+    Returns
+    -------
+    List[float]
+        Cumulative distances in mm at each time step.
+        The last element equals distance exactly.
+    """
+    if distance < 1e-6:
+        return [0.0]
+
+    t_a = v_max / a_max
+    d_a = 0.5 * a_max * t_a ** 2
+
+    if 2.0 * d_a >= distance:
+        t_a    = math.sqrt(distance / a_max)
+        v_peak = a_max * t_a
+        d_a    = 0.5 * a_max * t_a ** 2
+        T      = 2.0 * t_a
+    else:
+        v_peak  = v_max
+        t_cruise = (distance - 2.0 * d_a) / v_max
+        T        = 2.0 * t_a + t_cruise
+
+    samples = []
+    t = 0.0
+    while t <= T + 1e-9:
+        if t <= t_a:
+            s = 0.5 * a_max * t ** 2
+        elif t <= T - t_a:
+            s = d_a + v_peak * (t - t_a)
+        else:
+            dt_rem = T - t
+            s = distance - 0.5 * a_max * dt_rem ** 2
+        samples.append(min(max(s, 0.0), distance))
+        t += dt
+
+    if not samples or samples[-1] < distance - 1e-6:
+        samples.append(distance)
+
+    return samples
+
+
+def linear_waypoints(
+    p0: Point3D,
+    p1: Point3D,
+    v_max: float = 80.0,   # mm/s
+    a_max: float = 200.0,  # mm/s^2
+    dt: float = 0.05,      # s  (20 Hz)
+) -> List[Point3D]:
+    """Generate Cartesian waypoints along the straight line from p0 to p1.
+
+    Parameters
+    ----------
+    p0, p1  : start / end position as (x, y, z) in mm (robot base frame)
+    v_max   : maximum Cartesian speed in mm/s
+    a_max   : maximum Cartesian acceleration in mm/s^2
+    dt      : time between successive waypoints in seconds
+
+    Returns
+    -------
+    List[Point3D]
+        (x, y, z) waypoints in mm.  The last entry is always exactly p1.
+    """
+    dx = p1[0] - p0[0]
+    dy = p1[1] - p0[1]
+    dz = p1[2] - p0[2]
+    distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    if distance < 0.5:
+        return [p1]
+
+    ux, uy, uz = dx / distance, dy / distance, dz / distance
+
+    waypoints = []
+    for s in _trapezoidal_distances(distance, v_max, a_max, dt):
+        waypoints.append((
+            p0[0] + s * ux,
+            p0[1] + s * uy,
+            p0[2] + s * uz,
+        ))
+
+    waypoints[-1] = p1
+    return waypoints
+
+
+────────────────────────────────────────────────────────────────────────────────
+C.4  Pick-and-Place Control Node
+────────────────────────────────────────────────────────────────────────────────
+
+The following module implements the main ROS 2 pick-and-place control node for
+the Delta robot.  It contains two classes: PickAndPlaceStateMachine, which
+manages the nine-state finite state machine (IDLE -> CONFIRMING -> APPROACHING
+-> PICKING -> GRASPING -> LIFTING -> TRANSPORTING -> DROPPING -> RESETTING),
+and DeltaMainApp, which is the ROS 2 node that subscribes to camera detections,
+manages a multi-object target queue with belt-velocity extrapolation, and
+dispatches pick-and-place sequences.  The node also implements an iterative
+end-effector correction loop that uses a camera-detected laser marker on the
+gripper tip to reduce X-axis positioning error before each descent.
+
+File: src/delta_main_app/delta_main_app/main_app.py
+
+#!/usr/bin/env python3
+
+import math
+import time
+import threading
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PointStamped, PoseArray
+from std_msgs.msg import Float32, String
+
+from delta_common import config
+from delta_common.fk_ik import check_workspace, delta_calcInverse, e, f, re, rf
+from delta_motor_controller.motor_controller import DeltaMotorController
+from delta_motor_controller.pneumatic_gripper import PneumaticGripper
+from delta_main_app.belt_predictor import BeltPredictor
+
+# -- Pick-and-place geometry (mm, robot base frame) ---------------------------
+
+APPROACH_Z_OFFSET = 0.0
+LIFT_Z_OFFSET     = 30.0
+HOME_X = 0.0
+HOME_Y = 0.0
+HOME_Z = -350.0
+
+GRASP_WAIT_SEC  = 0.4
+DROP_WAIT_SEC   = 0.4
+MOVE_SETTLE_SEC = 0.05
+
+CONFIRM_FRAMES   = 2
+STABLE_THRESH_MM = 10.0
+
+
+def _clamp_z(z: float) -> float:
+    return max(config.Z_MIN, min(config.Z_MAX, z))
+
+
+def _approach_z(z_obj: float) -> float:
+    return _clamp_z(z_obj + APPROACH_Z_OFFSET)
+
+
+def _lift_z(z_obj: float) -> float:
+    return _clamp_z(z_obj + LIFT_Z_OFFSET)
+
+
+class PickAndPlaceStateMachine:
+    """
+    Pure FSM -- no ROS dependency.
+    All blocking arm moves run in a background thread.
+    """
+
+    def __init__(
+        self,
+        controller: DeltaMotorController,
+        gripper_pub,
+        state_pub,
+        logger,
+        get_next_pick_xy=None,
+    ):
+        self._ctrl           = controller
+        self._gripper_pub    = gripper_pub
+        self._state_pub      = state_pub
+        self._log            = logger
+        self._state          = "IDLE"
+        self._get_next_pick_xy = get_next_pick_xy
+
+        self._recent_xyz  = []
+        self._target_xyz  = None
+        self._busy        = False
+        self._lock        = threading.Lock()
+        self._ee_error_x  = None
+        self._ee_error_y  = None
+
+    @property
+    def current_pick_x(self):
+        with self._lock:
+            return self._target_xyz[0] if self._target_xyz else None
+
+    def detection_update(self, x: float, y: float, z: float) -> None:
+        with self._lock:
+            if self._busy:
+                return
+            if self._state == "IDLE":
+                self._state = "CONFIRMING"
+                self._recent_xyz = []
+                self._publish_state()
+            if self._state == "CONFIRMING":
+                self._recent_xyz.append((x, y, z))
+                if len(self._recent_xyz) > CONFIRM_FRAMES:
+                    self._recent_xyz.pop(0)
+                if len(self._recent_xyz) < CONFIRM_FRAMES:
+                    return
+                if self._is_stable(self._recent_xyz):
+                    avg_x = sum(p[0] for p in self._recent_xyz) / CONFIRM_FRAMES
+                    avg_y = sum(p[1] for p in self._recent_xyz) / CONFIRM_FRAMES
+                    avg_z = sum(p[2] for p in self._recent_xyz) / CONFIRM_FRAMES
+                    self._target_xyz = (avg_x, avg_y, avg_z)
+                    self._start_sequence()
+
+    def force_target(self, x: float, y: float, z: float) -> bool:
+        """Start a pick sequence immediately, bypassing confirmation.
+        Returns False if the robot is currently busy."""
+        with self._lock:
+            if self._busy:
+                return False
+            self._target_xyz = (x, y, z)
+            self._log.info(f"Queue target: ({x:.1f}, {y:.1f}, {z:.1f}) mm")
+            self._start_sequence()
+            return True
+
+    def no_detection(self) -> None:
+        with self._lock:
+            if self._busy:
+                return
+            if self._state == "CONFIRMING":
+                self._recent_xyz = []
+                self._state = "IDLE"
+                self._publish_state()
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @staticmethod
+    def _is_stable(positions) -> bool:
+        if len(positions) < 2:
+            return False
+        xs = [p[0] for p in positions]
+        ys = [p[1] for p in positions]
+        zs = [p[2] for p in positions]
+        spread = math.sqrt(
+            (max(xs) - min(xs)) ** 2
+            + (max(ys) - min(ys)) ** 2
+            + (max(zs) - min(zs)) ** 2
+        )
+        return spread < STABLE_THRESH_MM
+
+    def update_ee_error(self, err_x: float, err_y: float) -> None:
+        with self._lock:
+            if self._state not in ("APPROACHING", "PICKING"):
+                return
+            self._ee_error_x = err_x
+            self._ee_error_y = err_y
+
+    def _wait_fresh_ee_error(self, timeout=1.0):
+        """Collect fresh error samples and return their median."""
+        deadline = time.time() + timeout
+        samples_x, samples_y = [], []
+        while time.time() < deadline and len(samples_x) < 2:
+            with self._lock:
+                self._ee_error_x = None
+                self._ee_error_y = None
+            t_s = time.time()
+            while time.time() - t_s < 0.15:
+                time.sleep(0.02)
+                with self._lock:
+                    if self._ee_error_x is not None:
+                        samples_x.append(self._ee_error_x)
+                        samples_y.append(self._ee_error_y)
+                        break
+        if not samples_x:
+            return None, None
+        samples_x.sort()
+        samples_y.sort()
+        n = len(samples_x)
+        return samples_x[n // 2], samples_y[n // 2]
+
+    def _start_sequence(self) -> None:
+        self._busy = True
+        threading.Thread(target=self._run_sequence, daemon=True).start()
+
+    def _run_sequence(self) -> None:
+        from delta_common.fk_ik import delta_calcInverse, e, f, re, rf
+
+        x, y, z = self._target_xyz
+        z_platform = z + config.EE_OFFSET_Z_MM
+        az = _approach_z(z_platform)
+        lz = _lift_z(z_platform)
+
+        st_az, *_ = delta_calcInverse(x, y, az, e, f, re, rf)
+        use_approach = (st_az == 0)
+
+        try:
+            self._set_state("APPROACHING")
+            if use_approach:
+                if not self._move(x, y, az):
+                    raise RuntimeError("APPROACH failed")
+                time.sleep(MOVE_SETTLE_SEC)
+
+                # Dynamic Y-arrival gate: wait until object is under EE in Y.
+                if config.CONVEYOR_MODE and config.EE_CORRECTION_ENABLE:
+                    deadline_arr = time.time() + config.CONVEYOR_ARRIVAL_TIMEOUT_S
+                    no_signal = 0
+                    while time.time() < deadline_arr:
+                        _, ey = self._wait_fresh_ee_error(timeout=0.1)
+                        if ey is None:
+                            no_signal += 1
+                            if no_signal >= 5:
+                                break
+                            continue
+                        no_signal = 0
+                        if abs(ey) < config.CONVEYOR_ARRIVAL_Y_THRESH_MM:
+                            break
+                elif config.CONVEYOR_APPROACH_WAIT_SEC > 0:
+                    time.sleep(config.CONVEYOR_APPROACH_WAIT_SEC)
+
+                # Iterative EE X-correction using laser marker feedback.
+                if config.EE_CORRECTION_ENABLE:
+                    t_start = time.time()
+                    for i in range(config.EE_CORRECTION_MAX_ITERS):
+                        err_x, err_y = self._wait_fresh_ee_error(
+                            timeout=config.EE_CORRECTION_WAIT_S
+                        )
+                        if err_x is None:
+                            break
+                        dist_2d  = math.sqrt(err_x ** 2 + err_y ** 2)
+                        check_err = abs(err_x) if config.CONVEYOR_MODE else dist_2d
+                        if check_err < config.EE_CORRECTION_MIN_MM:
+                            break
+                        if check_err < config.EE_CORRECTION_THRESH_MM:
+                            break
+                        if time.time() - t_start > config.EE_CORRECTION_TIMEOUT_S:
+                            break
+                        x_new = x - err_x * config.EE_CORRECTION_GAIN
+                        y_new = y if config.CONVEYOR_MODE else y + err_y * config.EE_CORRECTION_GAIN
+                        x_new = max(-config.X_LIMIT + 5.0, min(config.X_LIMIT - 5.0, x_new))
+                        y_new = max(-config.Y_LIMIT + 5.0, min(config.Y_LIMIT - 5.0, y_new))
+                        x = x_new
+                        y = y_new
+                        self._move(x, y, az)
+                    time.sleep(0.1)
+
+            self._set_state("PICKING")
+            pick_z = _clamp_z(config.PICK_Z)
+            if not self._move(x, y, pick_z):
+                raise RuntimeError("PICK descend failed")
+            time.sleep(MOVE_SETTLE_SEC)
+
+            self._set_state("GRASPING")
+            self._gripper(1.0)
+            time.sleep(GRASP_WAIT_SEC)
+            with self._lock:
+                self._ee_error_x = None
+                self._ee_error_y = None
+
+            self._set_state("LIFTING")
+            if not self._move(x, y, lz):
+                raise RuntimeError("LIFT failed")
+            time.sleep(MOVE_SETTLE_SEC)
+
+            self._set_state("TRANSPORTING")
+            place_z = _clamp_z(config.PLACE_Z)
+            if not self._move(config.PLACE_X, config.PLACE_Y, place_z):
+                raise RuntimeError("TRANSPORT failed")
+            time.sleep(MOVE_SETTLE_SEC)
+
+            self._set_state("DROPPING")
+            self._gripper(0.0)
+            time.sleep(DROP_WAIT_SEC)
+
+        except RuntimeError as exc:
+            self._log.error(f"Sequence aborted: {exc}")
+            self._gripper(0.0)
+        except Exception as exc:
+            self._log.error(f"Unexpected error in sequence: {exc}", exc_info=True)
+            try:
+                self._gripper(0.0)
+            except Exception:
+                pass
+
+        finally:
+            self._set_state("RESETTING")
+            try:
+                next_xy = self._get_next_pick_xy() if self._get_next_pick_xy else None
+                if next_xy:
+                    nx, ny = next_xy
+                    self._move(nx, ny, HOME_Z, raw=True)
+                else:
+                    self._move(HOME_X, HOME_Y, HOME_Z, raw=True)
+            except Exception as exc:
+                self._log.error(f"Reset move failed: {exc}")
+            finally:
+                with self._lock:
+                    self._state      = "IDLE"
+                    self._busy       = False
+                    self._target_xyz = None
+                    self._recent_xyz = []
+                self._publish_state()
+
+    def _move(self, x: float, y: float, z: float, raw: bool = False) -> bool:
+        from delta_common.fk_ik import delta_calcInverse, e, f, re, rf
+
+        st, t1, t2, t3 = delta_calcInverse(x, y, z, e, f, re, rf)
+        if st != 0:
+            self._log.error(f"IK no solution for ({x:.1f}, {y:.1f}, {z:.1f})")
+            return False
+        if t1 < 0 or t2 < 0 or t3 < 0:
+            self._log.error(
+                f"Negative theta rejected: ({t1:.1f},{t2:.1f},{t3:.1f})"
+            )
+            return False
+
+        ok, _, _, _, err = self._ctrl.move_xyz(x, y, z, raw=raw)
+        if ok:
+            self._current_ee_xyz = (x, y, z - config.EE_OFFSET_Z_MM)
+        return ok
+
+    def _gripper(self, pos: float) -> None:
+        self._gripper_pub(pos)
+
+    def _set_state(self, state: str) -> None:
+        self._state = state
+        self._publish_state()
+        self._log.info(f"[FSM] -> {state}")
+
+    def _publish_state(self) -> None:
+        self._state_pub(self._state)
+
+
+class DeltaMainApp(Node):
+    def __init__(self):
+        super().__init__("delta_main_app")
+
+        self._explicit_shutdown = False
+        self._ctrl = DeltaMotorController(
+            can_port="can0",
+            vel_max=config.MOTOR_VEL_MAX,
+            acc_set=config.MOTOR_ACC_SET,
+        )
+        if config.ENABLE_MOTORS:
+            self._ctrl.connect()
+
+        self._gripper_pub = self.create_publisher(Float32, "/delta/gripper_cmd", 10)
+        self._state_pub   = self.create_publisher(String,  "/delta/robot_state",  10)
+
+        self._gripper = PneumaticGripper(can_channel='can0', can_id=4)
+        if config.ENABLE_MOTORS:
+            self._gripper.connect()
+
+        self._fsm = PickAndPlaceStateMachine(
+            controller       = self._ctrl,
+            gripper_pub      = self._send_gripper,
+            state_pub        = self._send_state,
+            logger           = self.get_logger(),
+            get_next_pick_xy = self._peek_next_pick_xy,
+        )
+
+        self._target_queue  = []
+        self._belt_vy_mm_s  = 0.0
+        self._queue_lock    = threading.Lock()
+        self._predictor     = BeltPredictor()
+        self._verify_deadline = 0.0
+
+        self._sub_all_targets = self.create_subscription(
+            PoseArray, "/delta/all_targets", self._all_targets_callback, 10
+        )
+        self._sub_velocity = self.create_subscription(
+            PointStamped, "/delta/object_velocity_mm_s", self._velocity_callback, 10
+        )
+        self._sub_status = self.create_subscription(
+            String, "/delta/detection_status", self._status_callback, 10
+        )
+        self._ee_error_x     = 0.0
+        self._ee_error_y     = 0.0
+        self._ee_error_count = 0
+        self._sub_ee_error = self.create_subscription(
+            PointStamped, "/delta/ee_error_mm", self._ee_error_callback, 10
+        )
+        self._pub_ee_fk   = self.create_publisher(PointStamped, "/delta/ee_fk_xyz",             10)
+        self._pub_ff_target = self.create_publisher(PointStamped, "/delta/matlab/target_xyz_mm", 10)
+        self._pub_ff_ee     = self.create_publisher(PointStamped, "/delta/matlab/ee_position_mm",10)
+
+        self._fsm._current_ee_xyz = None
+        self.create_timer(0.10, self._queue_timer)
+        self.create_timer(0.05, self._publish_ee_fk_timer)
+        self.create_timer(0.05, self._publish_feedforward_timer)
+
+        self._homing = True
+        threading.Thread(target=self._startup_home, daemon=True).start()
+
+    def _publish_ee_fk_timer(self) -> None:
+        xyz = self._fsm._current_ee_xyz
+        if xyz is None:
+            return
+        pt = PointStamped()
+        pt.header.stamp    = self.get_clock().now().to_msg()
+        pt.header.frame_id = "robot_base"
+        pt.point.x, pt.point.y, pt.point.z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+        self._pub_ee_fk.publish(pt)
+
+    def _publish_feedforward_timer(self) -> None:
+        now = self.get_clock().now().to_msg()
+        tgt = self._fsm._target_xyz
+        if tgt is not None:
+            pt = PointStamped()
+            pt.header.stamp = now
+            pt.header.frame_id = "robot_base"
+            pt.point.x, pt.point.y, pt.point.z = float(tgt[0]), float(tgt[1]), float(tgt[2])
+            self._pub_ff_target.publish(pt)
+        if config.ENABLE_MOTORS and self._ctrl.connected:
+            try:
+                ok, x, y, z = self._ctrl.get_current_xyz()
+                if ok:
+                    pt = PointStamped()
+                    pt.header.stamp    = now
+                    pt.header.frame_id = "robot_base"
+                    pt.point.x = float(x)
+                    pt.point.y = float(y)
+                    pt.point.z = float(z) - config.EE_OFFSET_Z_MM
+                    self._pub_ff_ee.publish(pt)
+            except Exception:
+                pass
+
+    def _ee_error_callback(self, msg: PointStamped) -> None:
+        alpha = config.EE_CORRECTION_ALPHA
+        self._ee_error_x = alpha * msg.point.x + (1.0 - alpha) * self._ee_error_x
+        self._ee_error_y = alpha * msg.point.y + (1.0 - alpha) * self._ee_error_y
+        self._ee_error_count += 1
+        self._fsm.update_ee_error(msg.point.x, msg.point.y)
+
+    def _all_targets_callback(self, msg: PoseArray) -> None:
+        with self._queue_lock:
+            candidates = [
+                (p.position.x * 1000.0, p.position.y * 1000.0, p.position.z * 1000.0)
+                for p in msg.poses
+            ]
+            if not candidates:
+                return
+            candidates.sort(key=lambda p: p[1])
+            now = time.time()
+
+            self._predictor.update_velocity(candidates[0][1], now)
+
+            queued_xs = []
+            for i, (qx, _, _, _) in enumerate(self._target_queue):
+                queued_xs.append(qx)
+                for cx, cy, cz in candidates:
+                    if abs(cx - qx) < 25.0:
+                        self._target_queue[i] = (cx, cy, cz, now)
+                        break
+
+            if not self._target_queue:
+                if self._fsm.state == "IDLE":
+                    self._target_queue = [(x, y, z, now) for x, y, z in candidates]
+                return
+
+            current_x = self._fsm.current_pick_x
+            for cx, cy, cz in candidates:
+                if len(self._target_queue) >= 5:
+                    break
+                if current_x is not None and abs(cx - current_x) < 25.0:
+                    continue
+                if all(abs(cx - qx) >= 25.0 for qx in queued_xs):
+                    self._target_queue.append((cx, cy, cz, now))
+                    queued_xs.append(cx)
+
+    def _velocity_callback(self, msg: PointStamped) -> None:
+        self._belt_vy_mm_s = msg.point.y
+
+    def _queue_timer(self) -> None:
+        if self._homing:
+            return
+        with self._queue_lock:
+            if self._fsm.state != "IDLE" or not self._target_queue:
+                return
+
+            now = time.time()
+            vy  = self._predictor.measured_vy
+            if vy is None:
+                vy = -config.CONVEYOR_BELT_SPEED_MM_S
+
+            fresh = []
+            for qx, qy, qz, qt in self._target_queue:
+                y_now = qy + vy * (now - qt)
+                if y_now < -(config.Y_LIMIT + 20.0):
+                    continue
+                fresh.append((qx, y_now, qz, now))
+
+            fresh.sort(key=lambda p: p[1])
+            self._target_queue = fresh
+
+            if not self._target_queue:
+                return
+
+            x, y, z, _ = self._target_queue.pop(0)
+
+            result   = self._predictor.predict(x, y)
+            x_pick   = x
+            y_pick   = result.y_pick
+            if not result.valid:
+                if y > config.Y_LIMIT and abs(x) <= config.X_LIMIT:
+                    y_pick = config.Y_LIMIT - 5.0
+                else:
+                    return
+            elif not check_workspace(x, y_pick, z + config.EE_OFFSET_Z_MM):
+                return
+
+            self._check_belt_verify()
+            if not self._fsm.force_target(x_pick, y_pick, z):
+                self._target_queue.insert(0, (x, y, z, now))
+
+    def _status_callback(self, msg: String) -> None:
+        if "NO_DETECTION" in msg.data or "LOST" in msg.data:
+            self._fsm.no_detection()
+
+    def _send_gripper(self, pos: float) -> None:
+        m = Float32()
+        m.data = float(pos)
+        self._gripper_pub.publish(m)
+        if config.ENABLE_MOTORS:
+            if pos > 0.3:
+                self._gripper.grip(wait=False)
+            else:
+                self._gripper.release(wait=False)
+
+    def _send_state(self, state: str) -> None:
+        m = String()
+        m.data = state
+        self._state_pub.publish(m)
+
+    def _check_belt_verify(self) -> None:
+        if self._verify_deadline == 0.0 or time.time() < self._verify_deadline:
+            return
+        self._verify_deadline = 0.0
+        vy = self._predictor.measured_vy
+        if vy is None:
+            return
+        measured = abs(vy)
+        expected = config.CONVEYOR_BELT_SPEED_MM_S
+        diff     = abs(measured - expected)
+        if diff > 1.0:
+            self.get_logger().warn(
+                f"Belt speed mismatch: measured={measured:.2f} mm/s, "
+                f"config={expected:.2f} mm/s, diff={diff:.2f} mm/s"
+            )
+
+    def _peek_next_pick_xy(self):
+        with self._queue_lock:
+            if not self._target_queue:
+                return None
+            qx, qy, _, qt = self._target_queue[0]
+            vy    = self._predictor.measured_vy or -config.CONVEYOR_BELT_SPEED_MM_S
+            y_now = qy + vy * (time.time() - qt)
+            result = self._predictor.predict(qx, y_now)
+            x_pre  = max(-config.X_LIMIT + 5.0, min(config.X_LIMIT - 5.0, qx))
+            y_pre  = max(-config.Y_LIMIT + 5.0, min(config.Y_LIMIT - 5.0, result.y_pick))
+            return (x_pre, y_pre)
+
+    def _startup_home(self) -> None:
+        time.sleep(0.5)
+        self._send_gripper(0.0)
+        try:
+            if config.ENABLE_MOTORS:
+                self._ctrl.move_xyz(HOME_X, HOME_Y, HOME_Z, raw=True)
+        except Exception as exc:
+            self.get_logger().error(f"Startup home failed: {exc}")
+        finally:
+            self._homing = False
+
+    def destroy_node(self) -> None:
+        self._homing = True
+        if self._explicit_shutdown:
+            self._send_gripper(0.0)
+            if config.ENABLE_MOTORS:
+                try:
+                    self._ctrl.move_xyz(HOME_X, HOME_Y, HOME_Z, raw=True)
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+                self._ctrl.shutdown()
+                self._gripper.disconnect()
+        super().destroy_node()
+
+
+def main(args=None):
+    import signal
+    rclpy.init(args=args)
+    node = DeltaMainApp()
+
+    def handle_sigint(*_):
+        node._explicit_shutdown = True
+        node.destroy_node()
+        rclpy.shutdown()
+
+    signal.signal(signal.SIGINT, handle_sigint)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if rclpy.ok():
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+END OF APPENDIX C
+================================================================================

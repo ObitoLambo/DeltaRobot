@@ -76,15 +76,10 @@ class DeltaMotorController:
     def move_xyz(self, x, y, z, raw=False):
         print(f"\nXYZ -> ({x:.2f}, {y:.2f}, {z:.2f})")
         if not raw:
-            if config.ERROR_MAP_ENABLE:
-                from delta_common import error_map as _em
-                cx, cy, cz = _em.correction(x, y, z, config.ERROR_MAP_FILE)
-                x += cx; y += cy; z += cz
-                print(f"Map correction ({cx:+.2f},{cy:+.2f},{cz:+.2f}) -> ({x:.2f}, {y:.2f}, {z:.2f})")
-            elif config.EE_OFFSET_X_MM or config.EE_OFFSET_Y_MM or config.EE_OFFSET_Z_MM:
+            if config.EE_OFFSET_X_MM or config.EE_OFFSET_Y_MM or config.EE_OFFSET_Z_MM:
                 x += config.EE_OFFSET_X_MM
                 y += config.EE_OFFSET_Y_MM
-                z -= config.EE_OFFSET_Z_MM
+                z += config.EE_OFFSET_Z_MM
                 print(f"EE offset applied -> ({x:.2f}, {y:.2f}, {z:.2f})")
 
         if not check_workspace(x, y, z):
@@ -159,19 +154,20 @@ class DeltaMotorController:
 
         Returns
         -------
-        (ok, fk_xyz, err)
+        (ok, fk_xyz, err, fb_deg)
             ok      : True if FK settled within POS_TOL_MM
             fk_xyz  : (x, y, z) mm from FK at final feedback position
             err     : residual FK error in mm
+            fb_deg  : (t1, t2, t3) actual motor angles read from CAN feedback, degrees
         """
         if not self.within_joint_limits(t1, t2, t3):
             print(f"Joint limit reject: ({t1:.1f},{t2:.1f},{t3:.1f})")
-            return False, None, float('inf')
+            return False, None, float('inf'), None
 
         st_ref, x_ref, y_ref, z_ref = delta_calcForward(t1, t2, t3, e, f, re, rf)
         if st_ref != 0:
             print(f"FK failed for commanded thetas ({t1:.1f},{t2:.1f},{t3:.1f})")
-            return False, None, float('inf')
+            return False, None, float('inf'), None
 
         print(
             f"\nThetas -> ({t1:.2f}°, {t2:.2f}°, {t3:.2f}°)  "
@@ -185,6 +181,7 @@ class DeltaMotorController:
         POLL_INTERVAL = 0.020
         deadline = time.time() + self.VERIFY_DELAY
         fk_xyz = None
+        fb_deg = None
         err = float('inf')
 
         while True:
@@ -199,7 +196,7 @@ class DeltaMotorController:
             )
             if st_fk != 0:
                 if time.time() >= deadline:
-                    return False, None, float('inf')
+                    return False, None, float('inf'), fb_deg
                 continue
 
             fk_xyz = (x_fk, y_fk, z_fk)
@@ -212,7 +209,7 @@ class DeltaMotorController:
                 break
 
         print(f"FK actual=({x_fk:.2f},{y_fk:.2f},{z_fk:.2f}) | err={err:.2f}mm")
-        return err < self.POS_TOL_MM, fk_xyz, err
+        return err < self.POS_TOL_MM, fk_xyz, err, fb_deg
 
     def get_current_xyz(self):
         """Read joint positions via CAN feedback and return the FK result.

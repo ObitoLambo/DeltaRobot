@@ -65,13 +65,13 @@ class PneumaticGripper:
 
     def grip(self, wait: bool = True) -> None:
         """Energize solenoid1 to grip (active-low: bit=0 → ON)."""
-        self._send(solenoid1=False)
+        self._send(solenoid1=True)
         if wait:
             time.sleep(self._grip_settle_s)
 
     def release(self, wait: bool = True) -> None:
         """De-energize solenoid1 to release (active-low: bit=1 → OFF)."""
-        self._send(solenoid1=True)
+        self._send(solenoid1=False)
         if wait:
             time.sleep(self._open_settle_s)
 
@@ -85,7 +85,7 @@ class PneumaticGripper:
 
     # ── internal ───────────────────────────────────────────────────────────────
 
-    def _send(self, solenoid1: bool = True, solenoid2: bool = True) -> None:
+    def _send(self, solenoid1: bool = False, solenoid2: bool = False) -> None:
         # Active-low board: bit=0 → solenoid energized (ON), bit=1 → de-energized (OFF).
         # Defaults are True (OFF) so unused solenoids 2-6 stay de-energized.
         if self._bus is None:

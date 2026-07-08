@@ -3,6 +3,7 @@
 # CHANGES: [1.1] depth lock and stale-depth protection, [1.2] reusable CLAHE/kernel allocation, [2.1] config validation, [2.3] stable anchor fix, [2.5] target/status publishers, [2.6] centralized tracking reset
 
 import math
+import threading
 import time
 from collections import deque
 from typing import Optional
@@ -64,11 +65,21 @@ class DeltaCamera(Node):
         self._timed_xyz_bufs: dict = {}     # per-track timestamped xyz history
         self.last_stable_xyz = None
 
+        self._depth_lock = threading.Lock()
+        self._depth_image = None   # H×W uint16, each count = 1 mm (aligned to color)
+        self.last_depth_track_id = None
+        self.depth_buffer = deque(maxlen=config.DEPTH_HISTORY_SIZE)
+
         self.sub_color = self.create_subscription(
             Image, config.COLOR_TOPIC, self.color_callback, 10
         )
         self.sub_info = self.create_subscription(
             CameraInfo, config.CAMERA_INFO_TOPIC, self.info_callback, 10
+        )
+        from rclpy.qos import QoSPresetProfiles
+        self.sub_depth = self.create_subscription(
+            Image, config.DEPTH_TOPIC, self._on_depth_image,
+            QoSPresetProfiles.SENSOR_DATA.value,
         )
         self._pub_target      = self.create_publisher(PointStamped, "/delta/target_xyz",          10)
         self._pub_velocity    = self.create_publisher(PointStamped, "/delta/object_velocity_mm_s", 10)
@@ -78,6 +89,7 @@ class DeltaCamera(Node):
         self._pub_ee_error    = self.create_publisher(PointStamped, "/delta/ee_error_mm",          10)
         self.create_service(Trigger, "/delta/calibrate_cam_offset", self._calibrate_offset_srv)
         self._ee_fk_pixel = None
+        self._ee_fk_xyz = None   # FK position in base frame (ground truth for ee_position_mm)
         self.create_subscription(
             PointStamped, "/delta/ee_fk_xyz", self._ee_fk_callback, 10
         )
@@ -96,6 +108,7 @@ class DeltaCamera(Node):
         self._validate_config()
 
     def _ee_fk_callback(self, msg: PointStamped):
+        self._ee_fk_xyz = (msg.point.x, msg.point.y, msg.point.z)
         px = self._project_base_to_pixel(msg.point.x, msg.point.y, msg.point.z)
         if px is not None:
             self._ee_fk_pixel = px
@@ -114,6 +127,11 @@ class DeltaCamera(Node):
         else:
             self.dist_coeffs = np.zeros((5, 1), dtype=np.float64)
 
+    def _on_depth_image(self, msg: Image) -> None:
+        arr = np.frombuffer(bytes(msg.data), dtype=np.uint16).reshape(msg.height, msg.width)
+        with self._depth_lock:
+            self._depth_image = arr
+
     def color_callback(self, msg: Image):
         if self.fx is None:
             return
@@ -127,7 +145,9 @@ class DeltaCamera(Node):
             self.get_logger().error(f"Color conversion failed: {ex}")
             return
 
-        annotated, best = self.process_frame(frame)
+        with self._depth_lock:
+            depth_snap = self._depth_image
+        annotated, best = self.process_frame(frame, depth_snap)
 
 
         t_end = time.perf_counter()
@@ -154,7 +174,7 @@ class DeltaCamera(Node):
         cv2.putText(frame, text, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(frame, text, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
-    def process_frame(self, frame):
+    def process_frame(self, frame, depth_image=None):
         annotated = frame.copy()
         best = None
         pure_camera_mode = bool(config.PURE_CAMERA_TEST_ENABLE)
@@ -173,24 +193,34 @@ class DeltaCamera(Node):
         )
         if ee_uv is not None:
             eu, ev = ee_uv
-            ee_cam = self.pixel_to_camera_xyz_mm(eu, ev, config.FAKE_DEPTH_M)
-            if ee_cam is not None:
-                ex_b, ey_b, ez_b = self.camera_to_base_mm(*ee_cam)
-                ee_pixel = (eu, ev)
-                ee_base_xy = (ex_b, ey_b)
-                pt = PointStamped()
-                pt.header.stamp = self.get_clock().now().to_msg()
-                pt.header.frame_id = "robot_base"
-                pt.point.x = ex_b
-                pt.point.y = ey_b
-                pt.point.z = ez_b
-                self._pub_ee_pos.publish(pt)
+            ee_pixel = (eu, ev)
             if getattr(config, "DRAW_EE_MARKER", True):
                 cv2.circle(annotated, (eu, ev), 6, (255, 255, 0), 2)
                 cv2.putText(annotated, "EE", (eu + 8, ev),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255, 255, 0), 1)
 
-        detections = self.generate_detections(frame, None)
+        # Publish EE position from FK (ground truth) rather than laser pixel projection.
+        # Laser projection uses FAKE_DEPTH_M calibrated for the belt, not the EE depth.
+        fk_xyz = getattr(self, '_ee_fk_xyz', None)
+        if fk_xyz is not None:
+            pt = PointStamped()
+            pt.header.stamp = self.get_clock().now().to_msg()
+            pt.header.frame_id = "robot_base"
+            pt.point.x = fk_xyz[0]
+            pt.point.y = fk_xyz[1]
+            pt.point.z = fk_xyz[2]
+            self._pub_ee_pos.publish(pt)
+            # Draw FK-projected EE on overlay when laser not detected (crosshair, green)
+            if ee_pixel is None and getattr(config, "DRAW_EE_MARKER", True):
+                fk_px_now = getattr(self, '_ee_fk_pixel', None)
+                if fk_px_now is not None:
+                    fu, fv = fk_px_now
+                    cv2.drawMarker(annotated, (fu, fv), (0, 200, 0),
+                                   cv2.MARKER_CROSS, 10, 1)
+                    cv2.putText(annotated, "FK", (fu + 8, fv),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.25, (0, 200, 0), 1)
+
+        detections = self.generate_detections(frame, depth_image)
         if not detections:
             self.handle_no_detection()
             return annotated, best
@@ -266,9 +296,10 @@ class DeltaCamera(Node):
                 for corner in np.round(corners_uv).astype(np.int32):
                     cv2.circle(annotated, tuple(corner.tolist()), 4, (0, 255, 255), -1)
 
-            z_m = config.FAKE_DEPTH_M
+            z_real = self.get_depth_meters(depth_image, u, v, x1, y1, x2, y2, track_id, contour)
+            z_m = z_real if z_real is not None else config.FAKE_DEPTH_M
 
-            print(f"DETECT: conf={conf:.2f} pixel=({u},{v})")
+            print(f"DETECT: conf={conf:.2f} pixel=({u},{v}) depth={'real' if z_real is not None else 'fake'}={z_m*1000:.0f}mm")
 
             xyz_cam = self.pixel_to_camera_xyz_mm(u, v, z_m)
             if xyz_cam is None:
@@ -297,7 +328,7 @@ class DeltaCamera(Node):
             wx, wy, wz = workspace_xyz
             # IK operates on the platform (motor plate), not the EE tip.
             # Convert EE-tip Z to platform Z before any workspace/IK check.
-            wz_platform = wz - config.EE_OFFSET_Z_MM
+            wz_platform = wz + config.EE_OFFSET_Z_MM
             in_workspace = self.check_workspace(wx, wy, wz_platform)
             # In conveyor mode, also allow objects in the approach zone (y > Y_LIMIT)
             # so the robot can pre-position while the object is still incoming.
@@ -536,31 +567,39 @@ class DeltaCamera(Node):
         else:
             error_det = best
 
-        if (ee_pixel is not None and error_det is not None
-                and self.fx is not None and self.fy is not None):
-            ex, ey = ee_pixel
+        # Visual reference: laser dot is preferred — it is the true physical EE position
+        # visible in the image. FK pixel falls back when laser is not detected.
+        # Error *computation* (below) still uses fk_xyz directly, not this pixel.
+        ee_ref_pixel = ee_pixel if ee_pixel is not None else fk_px
+
+        fk_xyz = getattr(self, '_ee_fk_xyz', None)
+        if error_det is not None and fk_xyz is not None:
             ox, oy = error_det["u"], error_det["v"]
             if not hasattr(self, '_ee_err_buf'):
                 self._ee_err_buf = deque(maxlen=10)
+            # Compute error directly in base frame.  The old pixel-based method
+            # used _project_base_to_pixel (actual EE z_cam ~480mm at home) then
+            # scaled by FAKE_DEPTH_M (576mm), inflating Y error by ~74% because
+            # the large CAM_TY_MM offset is depth-sensitive.  Negate X because
+            # camera x-axis is flipped vs base (x_base = -x_cam).
+            dx_mm = -(error_det["x_base"] - fk_xyz[0])
+            dy_mm = error_det["y_base"] - fk_xyz[1]
             if self._ee_err_buf:
-                last_ox = sum(e[0] for e in self._ee_err_buf) / len(self._ee_err_buf)
-                last_oy = sum(e[1] for e in self._ee_err_buf) / len(self._ee_err_buf)
-                if ((ox - ex - last_ox)**2 + (oy - ey - last_oy)**2) > 900:
+                last_dx = sum(e[0] for e in self._ee_err_buf) / len(self._ee_err_buf)
+                last_dy = sum(e[1] for e in self._ee_err_buf) / len(self._ee_err_buf)
+                if (dx_mm - last_dx)**2 + (dy_mm - last_dy)**2 > 900:
                     self._ee_err_buf.clear()
-            du = ox - ex
-            dv = oy - ey
-            z_cam_mm = config.FAKE_DEPTH_M * 1000.0
-            dx_mm = du * z_cam_mm / self.fx
-            dy_mm = dv * z_cam_mm / self.fy
             self._ee_err_buf.append((dx_mm, dy_mm))
             dx_smooth = sum(e[0] for e in self._ee_err_buf) / len(self._ee_err_buf)
             dy_smooth = sum(e[1] for e in self._ee_err_buf) / len(self._ee_err_buf)
 
-            cv2.line(annotated, (ex, ey), (ox, oy), (0, 255, 255), 1)
-            mx, my = (ex + ox) // 2, (ey + oy) // 2
-            cv2.putText(annotated, f"err {dx_smooth:+.0f},{dy_smooth:+.0f}mm",
-                        (mx + 4, my), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.25, (0, 255, 255), 1)
+            if ee_ref_pixel is not None:
+                ex, ey = ee_ref_pixel
+                cv2.line(annotated, (ex, ey), (ox, oy), (0, 255, 255), 1)
+                mx, my = (ex + ox) // 2, (ey + oy) // 2
+                cv2.putText(annotated, f"err {dx_smooth:+.0f},{dy_smooth:+.0f}mm",
+                            (mx + 4, my), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.25, (0, 255, 255), 1)
             err_pt = PointStamped()
             err_pt.header.stamp = self.get_clock().now().to_msg()
             err_pt.header.frame_id = "robot_base"
@@ -571,8 +610,7 @@ class DeltaCamera(Node):
             self._ee_err_frame = getattr(self, "_ee_err_frame", 0) + 1
             if self._ee_err_frame % 10 == 0:
                 self.get_logger().info(
-                    f"EE vs obj: dx={dx_smooth:+.1f} dy={dy_smooth:+.1f} mm  "
-                    f"(du={du} dv={dv} px)"
+                    f"EE vs obj: dx={dx_smooth:+.1f} dy={dy_smooth:+.1f} mm"
                 )
 
         if best is not None:
@@ -1417,7 +1455,10 @@ class DeltaCamera(Node):
                 x_min = int(pts[:, 0].min())
                 x_max = int(pts[:, 0].max())
                 y_min = int(pts[:, 1].min())
-                y_max = int(pts[:, 1].max())
+                # In CONVEYOR_MODE the approach zone is below the workspace in pixel
+                # space (higher V).  Extend y_max to frame bottom so incoming objects
+                # accumulate their track before entering the workspace polygon.
+                y_max = mask.shape[0] if config.CONVEYOR_MODE else int(pts[:, 1].max())
                 if not (x_min <= cx <= x_max and y_min <= cy <= y_max):
                     continue
 
@@ -2660,7 +2701,7 @@ class DeltaCamera(Node):
 
     def validate_target(self, x_base, y_base, z_base):
         # z_base is EE-tip Z; convert to platform Z for IK (motor_controller does the same).
-        z_platform = z_base - config.EE_OFFSET_Z_MM
+        z_platform = z_base + config.EE_OFFSET_Z_MM
         if not self.check_workspace(x_base, y_base, z_platform):
             return None, None, None, False, "OUTSIDE_WORKSPACE"
 
